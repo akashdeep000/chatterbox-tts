@@ -1,0 +1,21 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Python virtual environment
+.venv/
+*.pyc
+__pycache__/
+
+# Local development
+run.py
+.env
+
+# Documentation and temporary files
+ARCHITECTURE.md
+voices/
+scripts/

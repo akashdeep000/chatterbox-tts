@@ -2,8 +2,8 @@ fastapi
 uvicorn
 websockets
 pydantic
+pydantic-settings
 torch
 torchaudio
 python-dotenv
 chatterbox-tts
-soundfile

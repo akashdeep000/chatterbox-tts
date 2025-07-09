@@ -1,47 +1,90 @@
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import io
+import logging
+import time
 from typing import Optional
 
-# Placeholder for TTS engine and voice management
-# These will be implemented in other files.
-from tts import TextToSpeechEngine
+from .config import settings
+from .dependencies import get_tts_engine
+from .tts import TextToSpeechEngine
+from .voice_manager import VoiceManager
+from fastapi import File, UploadFile
 
-app = FastAPI()
+# Configure logging
+logging.basicConfig(level=settings.LOG_LEVEL)
+logger = logging.getLogger(__name__)
 
-# Initialize TTS engine and voice manager
-# In a real app, these would be initialized with proper configuration
-tts_engine = TextToSpeechEngine()
+app = FastAPI(debug=settings.DEBUG)
+
+# --- Middleware ---
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request Logging Middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    logger.info(f"Handled request: {request.method} {request.url.path} - Status: {response.status_code} - Duration: {duration:.4f}s")
+    return response
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint to verify the application is running.
+    """
+    return {"status": "ok"}
+
+# --- Security ---
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+async def get_api_key(api_key: str = Depends(api_key_header)):
+    if api_key != settings.API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key"
+        )
+    return api_key
 
 class TTSRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
 
-@app.post("/tts/generate")
-async def tts_generate(request: TTSRequest):
+@app.post("/tts/generate", dependencies=[Depends(get_api_key)])
+async def tts_generate(request: TTSRequest, tts_engine: TextToSpeechEngine = Depends(get_tts_engine)):
     """
-    Generates a complete audio file for the given text.
+    Generates and streams audio for the given text.
     """
     try:
-        # Generate audio
-        audio_data = tts_engine.generate(text=request.text, voice_id=request.voice_id)
-
-        # Return the audio as a streaming response
-        return StreamingResponse(io.BytesIO(audio_data), media_type="audio/wav")
+        logger.info(f"Received TTS request for voice_id: {request.voice_id}")
+        audio_stream = tts_engine.stream(text=request.text, voice_id=request.voice_id)
+        return StreamingResponse(audio_stream, media_type="audio/wav")
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        logger.error(f"TTS generation failed: {e}", exc_info=True)
+        return JSONResponse(content={"error": "Internal server error"}, status_code=500)
 
 @app.websocket("/tts/stream")
-async def tts_stream(websocket: WebSocket):
+async def tts_stream(websocket: WebSocket, api_key: str = Depends(get_api_key), tts_engine: TextToSpeechEngine = Depends(get_tts_engine)):
     """
     Streams generated audio in chunks over a WebSocket connection.
     """
     await websocket.accept()
     try:
         while True:
-            # Receive a JSON request from the client
             data = await websocket.receive_json()
             text = data.get("text")
             voice_id = data.get("voice_id")
@@ -50,16 +93,50 @@ async def tts_stream(websocket: WebSocket):
                 await websocket.send_json({"error": "No text provided"})
                 continue
 
-            # Stream audio chunks
+            logger.info(f"Streaming TTS for voice_id: {voice_id}")
             for chunk in tts_engine.stream(text=text, voice_id=voice_id):
                 await websocket.send_bytes(chunk)
 
     except WebSocketDisconnect:
-        print("Client disconnected")
+        logger.info("Client disconnected from WebSocket.")
     except Exception as e:
-        await websocket.send_json({"error": str(e)})
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+        await websocket.send_json({"error": "An unexpected error occurred."})
     finally:
         await websocket.close()
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.post("/voices", dependencies=[Depends(get_api_key)])
+async def upload_voice(file: UploadFile = File(...), voice_manager: VoiceManager = Depends()):
+    """
+    Upload a new voice file.
+    """
+    try:
+        contents = await file.read()
+        voice_manager.save_voice(file.filename, contents)
+        return JSONResponse(content={"voice_id": file.filename, "message": "Voice uploaded successfully."}, status_code=201)
+    except FileExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error(f"Voice upload failed: {e}", exc_info=True)
+        return JSONResponse(content={"error": "Internal server error"}, status_code=500)
+
+@app.get("/voices", dependencies=[Depends(get_api_key)])
+async def list_voices(voice_manager: VoiceManager = Depends()):
+    """
+    Get a list of all available voices.
+    """
+    return voice_manager.list_voices()
+
+@app.delete("/voices/{voice_id}", dependencies=[Depends(get_api_key)])
+async def delete_voice(voice_id: str, voice_manager: VoiceManager = Depends()):
+    """
+    Delete a specific voice by its ID.
+    """
+    try:
+        voice_manager.delete_voice(voice_id)
+        return JSONResponse(content={"message": f"Voice '{voice_id}' deleted successfully."})
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found.")
+    except Exception as e:
+        logger.error(f"Voice deletion failed: {e}", exc_info=True)
+        return JSONResponse(content={"error": "Internal server error"}, status_code=500)
