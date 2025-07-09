@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+websockets
+pydantic
+torch
+torchaudio
+python-dotenv
+chatterbox-tts
+soundfile
