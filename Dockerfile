@@ -7,13 +7,13 @@ WORKDIR /app
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
-    python3.10 \
+    python3 \
     python3-venv \
     libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create and activate a virtual environment
-RUN python3.10 -m venv /app/venv
+RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 # Install Python dependencies
