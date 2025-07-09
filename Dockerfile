@@ -1,6 +1,6 @@
 # Stage 1: Builder Environment
 # Use a -devel image which includes the full CUDA toolkit and compilers
-FROM nvidia/cuda:12.5.1-cudnn8-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 AS builder
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
@@ -27,7 +27,7 @@ COPY ./static ./static
 
 # Stage 2: Production Environment
 # Use a smaller -runtime image which only includes the CUDA runtime
-FROM nvidia/cuda:12.5.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
 # Create a non-root user for security
 RUN useradd --create-home appuser
