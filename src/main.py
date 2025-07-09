@@ -1,8 +1,9 @@
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import io
 import logging
@@ -20,6 +21,10 @@ logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(debug=settings.DEBUG)
+
+# --- Static Files ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 # --- Middleware ---
 
@@ -40,6 +45,11 @@ async def log_requests(request: Request, call_next):
     duration = time.time() - start_time
     logger.info(f"Handled request: {request.method} {request.url.path} - Status: {response.status_code} - Duration: {duration:.4f}s")
     return response
+
+
+@app.get("/", response_class=FileResponse)
+async def read_root():
+    return "static/index.html"
 
 
 @app.get("/health")
@@ -77,33 +87,6 @@ async def tts_generate(request: TTSRequest, tts_engine: TextToSpeechEngine = Dep
         logger.error(f"TTS generation failed: {e}", exc_info=True)
         return JSONResponse(content={"error": "Internal server error"}, status_code=500)
 
-@app.websocket("/tts/stream")
-async def tts_stream(websocket: WebSocket, api_key: str = Depends(get_api_key), tts_engine: TextToSpeechEngine = Depends(get_tts_engine)):
-    """
-    Streams generated audio in chunks over a WebSocket connection.
-    """
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_json()
-            text = data.get("text")
-            voice_id = data.get("voice_id")
-
-            if not text:
-                await websocket.send_json({"error": "No text provided"})
-                continue
-
-            logger.info(f"Streaming TTS for voice_id: {voice_id}")
-            for chunk in tts_engine.stream(text=text, voice_id=voice_id):
-                await websocket.send_bytes(chunk)
-
-    except WebSocketDisconnect:
-        logger.info("Client disconnected from WebSocket.")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-        await websocket.send_json({"error": "An unexpected error occurred."})
-    finally:
-        await websocket.close()
 
 @app.post("/voices", dependencies=[Depends(get_api_key)])
 async def upload_voice(file: UploadFile = File(...), voice_manager: VoiceManager = Depends()):

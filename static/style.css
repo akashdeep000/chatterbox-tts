@@ -1,0 +1,131 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
+
+:root {
+    --primary-color: #00a8ff;
+    --secondary-color: #9c88ff;
+    --background-color: #1e1e1e;
+    --surface-color: #2d2d2d;
+    --text-color: #f1f1f1;
+    --error-color: #e74c3c;
+}
+
+body {
+    font-family: 'Roboto', sans-serif;
+    background-color: var(--background-color);
+    color: var(--text-color);
+    margin: 0;
+    padding: 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+h1 {
+    font-size: 3rem;
+    font-weight: 700;
+    color: var(--primary-color);
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-bottom: 2rem;
+}
+
+.container {
+    background-color: var(--surface-color);
+    padding: 2rem;
+    border-radius: 10px;
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+    margin-bottom: 2rem;
+    width: 100%;
+    max-width: 600px;
+    transition: transform 0.3s ease;
+}
+
+h2 {
+    font-size: 1.5rem;
+    margin-top: 0;
+    border-bottom: 2px solid var(--primary-color);
+    padding-bottom: 0.5rem;
+    margin-bottom: 1.5rem;
+}
+
+input, textarea, select, button {
+    width: 100%;
+    padding: 0.8rem 1rem;
+    margin-bottom: 1rem;
+    border-radius: 5px;
+    border: 1px solid #444;
+    background-color: #333;
+    color: var(--text-color);
+    font-size: 1rem;
+    box-sizing: border-box;
+}
+
+textarea {
+    resize: vertical;
+    min-height: 100px;
+}
+
+button {
+    background: linear-gradient(45deg, var(--primary-color), var(--secondary-color));
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-weight: 700;
+    transition: all 0.3s ease;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+button:hover {
+    opacity: 0.9;
+    transform: translateY(-2px);
+    box-shadow: 0 6px 8px rgba(0, 0, 0, 0.15);
+}
+
+#voice-list {
+    list-style: none;
+    padding: 0;
+}
+
+#voice-list li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.8rem;
+    border-bottom: 1px solid #444;
+    transition: background-color 0.3s ease;
+}
+
+#voice-list li:hover {
+    background-color: #333;
+}
+
+.delete-voice {
+    background: var(--error-color);
+    padding: 0.4rem 0.8rem;
+    font-size: 0.9rem;
+    width: auto;
+    margin: 0;
+}
+
+#tts-audio {
+    width: 100%;
+    margin-top: 1rem;
+}
+
+#voice-file {
+    padding: 0;
+}
+
+#voice-file::file-selector-button {
+    background: #444;
+    color: var(--text-color);
+    border: none;
+    padding: 0.8rem 1rem;
+    border-radius: 5px 0 0 5px;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+}
+
+#voice-file::file-selector-button:hover {
+    background-color: #555;
+}

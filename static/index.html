@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chatterbox TTS</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>Chatterbox TTS</h1>
+
+    <div class="container">
+        <h2>API Key</h2>
+        <input type="text" id="api-key" placeholder="Enter your API key">
+        <button id="save-api-key">Save</button>
+    </div>
+
+    <div class="container">
+        <h2>Voices</h2>
+        <ul id="voice-list"></ul>
+        <input type="file" id="voice-file">
+        <button id="upload-voice">Upload</button>
+    </div>
+
+    <div class="container">
+        <h2>Text-to-Speech</h2>
+        <textarea id="tts-text" placeholder="Enter text to synthesize"></textarea>
+        <select id="tts-voice"></select>
+        <div class="tts-controls">
+            <button id="generate-tts">Generate</button>
+            <button id="stop-tts" disabled>Stop</button>
+        </div>
+        <audio id="tts-audio" controls></audio>
+        <div id="streaming-log"></div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>

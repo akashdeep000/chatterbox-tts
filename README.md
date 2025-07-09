@@ -4,7 +4,7 @@ Chatterbox TTS is a high-performance, containerized Text-to-Speech (TTS) service
 
 ## Project Overview
 
-This project provides a flexible and scalable solution for generating speech from text. It exposes both a RESTful API for generating complete audio files and a WebSocket endpoint for low-latency audio streaming. The system is built to be easily deployable and managed as a serverless endpoint.
+This project provides a flexible and scalable solution for generating speech from text. It exposes a RESTful API for generating complete audio files and is built to be easily deployable and managed as a serverless endpoint.
 
 ## Prerequisites
 
@@ -69,7 +69,7 @@ The `voice_id` for your new voice will be the filename (e.g., `voice.wav`).
 
 ### REST API: `/tts/generate`
 
-This endpoint generates a complete audio file and returns it as a `.wav` file.
+This endpoint streams the generated audio, making it suitable for real-time applications.
 
 **Example with `curl` (default voice):**
 
@@ -101,37 +101,6 @@ curl -X POST \
   http://localhost:8000/tts/generate --output demo_output.wav
 ```
 
-### WebSocket API: `/tts/stream`
-
-This endpoint streams audio chunks in real-time, making it ideal for low-latency applications.
-
-**Python Example:**
-
-```python
-import asyncio
-import websockets
-import json
-
-async def stream_tts():
-    uri = "ws://localhost:8000/tts/stream"
-    async with websockets.connect(uri) as websocket:
-        request = {
-            "text": "This is a real-time audio stream.",
-            "voice_id": "your_voice.wav"  # Optional
-        }
-        await websocket.send(json.dumps(request))
-
-        with open("stream_output.wav", "wb") as f:
-            try:
-                while True:
-                    chunk = await websocket.recv()
-                    f.write(chunk)
-            except websockets.exceptions.ConnectionClosed:
-                print("Stream finished.")
-
-if __name__ == "__main__":
-    asyncio.run(stream_tts())
-```
 
 ### Voice Management API
 

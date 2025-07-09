@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-websockets
 pydantic
 pydantic-settings
 torch
