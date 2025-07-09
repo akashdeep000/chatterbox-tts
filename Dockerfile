@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir --upgrade pip &&
 
 # Copy source code
 COPY ./src ./src
+COPY ./static ./static
 
 # Stage 2: Production Environment
 # Use a smaller -runtime image which only includes the CUDA runtime
@@ -36,6 +37,7 @@ WORKDIR /home/appuser
 # Copy the virtual environment and source code from the builder stage
 COPY --from=builder /app/venv ./venv
 COPY --from=builder /app/src ./src
+COPY --from=builder /app/static ./static
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
