@@ -2,7 +2,7 @@ import io
 import torch
 import soundfile as sf
 from chatterbox.tts import ChatterboxTTS
-from .voice_manager import VoiceManager
+from voice_manager import VoiceManager
 
 class TextToSpeechEngine:
     """

@@ -7,7 +7,7 @@ from typing import Optional
 
 # Placeholder for TTS engine and voice management
 # These will be implemented in other files.
-from .tts import TextToSpeechEngine
+from tts import TextToSpeechEngine
 
 app = FastAPI()
 
