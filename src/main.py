@@ -1,6 +1,6 @@
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import io
 from typing import Optional
@@ -31,7 +31,7 @@ async def tts_generate(request: TTSRequest):
         # Return the audio as a streaming response
         return StreamingResponse(io.BytesIO(audio_data), media_type="audio/wav")
     except Exception as e:
-        return {"error": str(e)}, 500
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 @app.websocket("/tts/stream")
 async def tts_stream(websocket: WebSocket):

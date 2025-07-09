@@ -1,7 +1,9 @@
 import io
 import torch
-import soundfile as sf
+import torchaudio
 from chatterbox.tts import ChatterboxTTS
+import tempfile
+import os
 from voice_manager import VoiceManager
 
 class TextToSpeechEngine:
@@ -40,10 +42,16 @@ class TextToSpeechEngine:
 
         # Generate speech and return it as a byte string.
         audio_tensor = self.tts.generate(text, audio_prompt_path=audio_prompt_path)
-        buffer = io.BytesIO()
-        sf.write(buffer, audio_tensor.numpy(), self.tts.config.sample_rate, format='WAV')
-        buffer.seek(0)
-        return buffer.read()
+        # Use a temporary file to save the audio, then read it back.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+            torchaudio.save(tmpfile.name, audio_tensor, self.tts.sr)
+            tmpfile.seek(0)
+            audio_bytes = tmpfile.read()
+
+        # Clean up the temporary file
+        os.remove(tmpfile.name)
+
+        return audio_bytes
 
     def stream(self, text: str, voice_id: str = None):
         """
