@@ -17,6 +17,15 @@ RUN apt-get update && apt-get install -y \
     build-essential && \
     rm -rf /var/lib/apt/lists/*
 
+# Create a non-root user and set up the app directory
+RUN useradd --create-home appuser && \
+    mkdir -p /app/voices && \
+    chown -R appuser:appuser /app
+
+# Switch to the non-root user
+USER appuser
+WORKDIR /app
+
 # Create and activate a virtual environment
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
@@ -32,17 +41,10 @@ COPY ./static ./static
 COPY ./scripts ./scripts
 COPY run.py .
 
+# Download models
 RUN python3 scripts/download_models.py
 
-# Create a non-root user and change ownership of the app directory
-RUN useradd --create-home appuser && chown -R appuser:appuser /app
-
-USER appuser
-WORKDIR /app
-
 # Set environment variables
-# PYTHONUNBUFFERED is already set at the top of the file.
-# PATH is already set to use the venv.
 ENV MODEL_PATH="/app/models"
 
 # Expose the application port
