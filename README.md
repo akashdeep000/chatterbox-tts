@@ -223,7 +223,7 @@ curl -X DELETE \
 
 This project is optimized for deployment on cloud platforms like [RunPod](https://runpod.io), where you can easily deploy the container as a serverless GPU endpoint. When deploying on RunPod, ensure you:
 
-1.  Use the Docker image you built (`chatterbox-tts:latest`).
+1.  Use the Docker image you built (`your-docker-username/chatterbox-tts:latest`) or the pre-built image from Docker Hub (`akashdeep000/chatterbox-tts:latest`).
 2.  Configure a persistent volume and map it to `/app/voices` in the container.
 3.  Expose the container's port `8000`.
 
