@@ -34,18 +34,16 @@ COPY run.py .
 
 RUN python3 scripts/download_models.py
 
-# Create a non-root user for security
-RUN useradd --create-home appuser
-USER appuser
-WORKDIR /home/appuser
+# Create a non-root user and change ownership of the app directory
+RUN useradd --create-home appuser && chown -R appuser:appuser /app
 
-# Copy the application from /app to the user's home directory
-COPY --from=0 /app .
+USER appuser
+WORKDIR /app
 
 # Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PATH="/home/appuser/venv/bin:$PATH"
-ENV MODEL_PATH="/home/appuser/models"
+# PYTHONUNBUFFERED is already set at the top of the file.
+# PATH is already set to use the venv.
+ENV MODEL_PATH="/app/models"
 
 # Expose the application port
 EXPOSE 8000
