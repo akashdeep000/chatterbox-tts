@@ -22,7 +22,7 @@ class TextToSpeechEngine:
             print("Warning: MPS is not available, falling back to CPU.")
             device = "cpu"
         self.device = device
-        self.tts = ChatterboxTTS.from_pretrained(
+        self.tts = ChatterboxTTS.from_local(
             settings.MODEL_PATH,
             device=device
         )
