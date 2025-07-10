@@ -30,7 +30,7 @@ jobs:
         with:
           push: true
           tags: |
-            akashdeep000/chatterbox-tts:latest
-            akashdeep000/chatterbox-tts:${{ github.sha }}
-          cache-from: type=registry,ref=akashdeep000/chatterbox-tts:buildcache
-          cache-to: type=registry,ref=akashdeep000/chatterbox-tts:buildcache,mode=max
+            ${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:${{ github.sha }}
+          cache-from: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:buildcache
+          cache-to: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:buildcache,mode=max

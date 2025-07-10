@@ -52,17 +52,51 @@ docker run -d -p 8000:8000 \
   chatterbox-tts:latest
 ```
 
-## Adding Cloned Voices
+## Docker Hub and GitHub Actions
 
-You can add new voices to the TTS engine by providing audio files. The `clone_voice.py` script copies your audio file into the `voices` directory, which is mounted into the container.
+### Using the Pre-built Docker Image
 
-To add a new voice, run the following command on your host machine:
+Instead of building the Docker image locally, you can use the pre-built image from Docker Hub, which is automatically updated with the latest changes.
+
+**1. Pull the Image**
 
 ```bash
-python3 scripts/clone_voice.py /path/to/your/voice.wav
+docker pull akashdeep000/chatterbox-tts:latest
 ```
 
-The `voice_id` for your new voice will be the filename (e.g., `voice.wav`).
+**2. Run the Container**
+
+Use the pulled image to run the container:
+
+```bash
+docker run -d -p 8000:8000 \
+  --gpus all \
+  -v $(pwd)/voices:/home/appuser/voices \
+  --env-file .env \
+  --name chatterbox-tts \
+  akashdeep000/chatterbox-tts:latest
+```
+
+### Automated Builds with GitHub Actions
+
+This repository uses GitHub Actions to automate the building and publishing of the Docker image to Docker Hub. On every push, a new image is built and tagged with `latest` and the commit SHA.
+
+You can view the workflow configuration at [`.github/workflows/publish-docker.yml`](.github/workflows/publish-docker.yml:1).
+
+#### Setup
+
+To enable the workflow to publish to your Docker Hub account, you need to configure the following repository secrets and variables in your GitHub repository settings:
+
+1.  **`DOCKERHUB_USERNAME`**:
+    *   **Type**: Variable
+    *   **Value**: Your Docker Hub username.
+    *   Go to `Settings` > `Secrets and variables` > `Actions` > `Variables` and add a new repository variable.
+
+2.  **`DOCKERHUB_TOKEN`**:
+    *   **Type**: Secret
+    *   **Value**: Your Docker Hub access token. You can generate one in your Docker Hub account settings.
+    *   Go to `Settings` > `Secrets and variables` > `Actions` > `Secrets` and add a new repository secret.
+
 
 ## API Usage
 
