@@ -46,7 +46,7 @@ Run the container, mapping port `8000`, providing the environment variables, and
 ```bash
 docker run -d -p 8000:8000 \
   --gpus all \
-  -v $(pwd)/voices:/home/appuser/voices \
+  -v $(pwd)/voices:/app/voices \
   --env-file .env \
   --name chatterbox-tts \
   chatterbox-tts:latest
@@ -71,7 +71,7 @@ Use the pulled image to run the container:
 ```bash
 docker run -d -p 8000:8000 \
   --gpus all \
-  -v $(pwd)/voices:/home/appuser/voices \
+  -v $(pwd)/voices:/app/voices \
   --env-file .env \
   --name chatterbox-tts \
   akashdeep000/chatterbox-tts:latest
