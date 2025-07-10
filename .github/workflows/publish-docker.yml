@@ -7,6 +7,8 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -27,6 +29,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           push: true
-          tags: akashdeep000/chatterbox-tts:latest
-          cache-from: type=registry,ref=user/app:buildcache
-          cache-to: type=registry,ref=user/app:buildcache,mode=max
+          tags: |
+            akashdeep000/chatterbox-tts:latest
+            akashdeep000/chatterbox-tts:${{ github.sha }}
+          cache-from: type=registry,ref=akashdeep000/chatterbox-tts:buildcache
+          cache-to: type=registry,ref=akashdeep000/chatterbox-tts:buildcache,mode=max
