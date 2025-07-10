@@ -27,6 +27,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           push: true
-          tags: akashdeep/chatterbox-tts:latest
+          tags: akashdeep000/chatterbox-tts:latest
           cache-from: type=registry,ref=user/app:buildcache
           cache-to: type=registry,ref=user/app:buildcache,mode=max
