@@ -11,7 +11,6 @@ The system is designed to be a containerized application running on a RunPod GPU
 ```mermaid
 graph TD
     subgraph "User's Environment"
-        WS_Client[WebSocket Client]
         REST_Client[REST Client]
     end
 
@@ -30,12 +29,10 @@ graph TD
         end
     end
 
-    WS_Client -- "WebSocket Request (text, voice_id)" --> APIServer
     REST_Client -- "REST Request (text, voice_id)" --> APIServer
     APIServer -- "Load Voice" --> PersistentVolume
     PersistentVolume -- "Voice Data" --> TTS_Engine
     TTS_Engine -- "Generate Audio" --> APIServer
-    APIServer -- "Stream Audio Chunks" --> WS_Client
     APIServer -- "Return Audio File" --> REST_Client
 
     style PersistentVolume fill:#f9f,stroke:#333,stroke-width:2px
@@ -45,7 +42,7 @@ graph TD
 
 *   **RunPod Instance:** A cloud-based virtual machine with a dedicated GPU (e.g., NVIDIA RTX 3090 or A-series GPUs) to accelerate the TTS model inference.
 *   **Docker Container:** An isolated environment created from a Docker image that packages the application, its dependencies, and the necessary runtime. This ensures consistency across different environments.
-*   **API Server:** A Python-based web server (using FastAPI) that handles both REST and WebSocket requests. It manages voice models, generates speech, and can either stream the audio in real-time (via WebSockets) or return a complete audio file (via REST).
+*   **API Server:** A Python-based web server (using FastAPI) that handles REST requests. It manages voice models, generates speech, and can stream the audio back to the client.
 *   **Chatterbox TTS Engine:** The core Python library responsible for synthesizing speech from text using the base TTS model and the selected cloned voice.
 *   **Persistent Network Volume:** A network-attached storage volume provided by RunPod. It is used to store cloned voice files (e.g., `.pth` files) so they persist even if the RunPod instance is restarted or changed.
 
@@ -55,79 +52,83 @@ graph TD
 *   **Python Version:** Python 3.10+
 *   **Web Framework:** **FastAPI**. Chosen for its high performance, asynchronous capabilities (essential for streaming), and automatic data validation with Pydantic.
 *   **ASGI Server:** **Uvicorn**. A lightning-fast ASGI server, required to run FastAPI.
-*   **Audio Streaming Protocol:** **WebSockets**. Provides a persistent, low-latency, bidirectional communication channel perfect for real-time audio streaming.
 *   **Core Libraries:**
     *   `torch` & `torchaudio`: For deep learning model operations and audio processing.
-    *   `websockets`: The Python library for building WebSocket servers and clients.
     *   `pydantic`: For data validation and settings management.
 
 ## 3. Containerization Strategy
 
-The application will be containerized using a `Dockerfile`. This file will define the steps to build a portable image containing the entire application stack.
+The application is containerized using a multi-stage `Dockerfile` for a secure and optimized production image.
 
-### Dockerfile Plan
+### Multi-Stage Dockerfile
+
+*   **Builder Stage:** The first stage uses a `devel` image with the full CUDA toolkit to install dependencies and build the application. This keeps the final image smaller.
+*   **Production Stage:** The second stage uses a lightweight `runtime` image and copies the application and virtual environment from the builder. It runs the application as a non-root user (`appuser`) for enhanced security.
+*   **Health Check:** A `HEALTHCHECK` instruction is included to monitor the `/health` endpoint, allowing container orchestrators to manage the application's lifecycle automatically.
+
+### Production Dockerfile
 
 ```dockerfile
-# 1. Start from the official NVIDIA CUDA base image
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+# Stage 1: Builder Environment
+FROM nvidia/cuda:12.5.1-cudnn8-devel-ubuntu22.04 AS builder
 
-# 2. Set up environment
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# 3. Install system dependencies and Python
+# Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
-    python3-pip \
-    libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+    python3.10-venv \
+    libsndfile1 && \
+    rm -rf /var/lib/apt/lists/*
 
-# 4. Copy requirements and install Python packages
+# Create and activate a virtual environment
+RUN python3.10 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# Install Python dependencies
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy the application source code
-COPY ./src /app
+# Copy source code
+COPY ./src ./src
 
-# 6. Expose the port the API server will run on
+# Stage 2: Production Environment
+FROM nvidia/cuda:12.5.1-cudnn8-runtime-ubuntu22.04
+
+# Create a non-root user for security
+RUN useradd --create-home appuser
+USER appuser
+WORKDIR /home/appuser
+
+# Copy the virtual environment and source code
+COPY --from=builder /app/venv ./venv
+COPY --from=builder /app/src ./src
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PATH="/home/appuser/venv/bin:$PATH"
+
+# Expose the application port
 EXPOSE 8000
 
-# 7. Define the command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Health check to ensure the application is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+# Define the command to run the application
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 ## 4. API Design
 
-The API will expose two endpoints: one for real-time streaming via WebSockets and another for generating complete audio files via a standard RESTful endpoint.
+The API will expose a RESTful endpoint for generating complete audio files.
 
-### Endpoint 1: WebSocket for Streaming
-
-*   **Endpoint:** `ws://<runpod-instance-url>/tts/stream`
-*   **Description:** For low-latency, real-time TTS applications.
-
-#### Communication Flow
-
-1.  The client establishes a WebSocket connection.
-2.  The client sends a JSON message with the text and voice ID.
-3.  The server streams back binary audio data in chunks.
-
-#### Request Message (Client -> Server)
-
-```json
-{
-  "text": "Hello, this is a test of the real-time text-to-speech system.",
-  "voice_id": "cloned_voice_alpha"
-}
-```
-
-#### Response Message (Server -> Client)
-
-The server streams a sequence of binary messages, each containing a chunk of raw audio data.
-
-### Endpoint 2: REST for File Generation
+### REST for File Generation
 
 *   **Endpoint:** `POST /tts/generate`
-*   **Description:** For applications that require the complete audio file at once.
+*   **Description:** Generates and streams audio for the given text.
 
 #### Request Body
 
@@ -157,16 +158,69 @@ A JSON object with the same structure as the WebSocket request:
     }
     ```
 
+### Example `curl` Command
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <YOUR_API_KEY>" \
+  -d '{"text": "Hello, this is a test of the live demo."}' \
+  http://localhost:8000/tts/generate --output demo_output.wav
+```
+
+### Endpoint 3: Voice Management APIs
+
+A set of RESTful endpoints will be provided to manage custom voice models.
+
+#### `POST /voices`
+
+*   **Description:** Upload a new voice file.
+*   **Request Body:** `multipart/form-data` with a single file field named `file`.
+*   **Success Response:**
+  *   **Status Code:** `201 Created`
+  *   **Body:**
+      ```json
+      {
+        "voice_id": "new_voice_name.pth",
+        "message": "Voice uploaded successfully."
+      }
+      ```
+
+#### `GET /voices`
+
+*   **Description:** Get a list of all available voices.
+*   **Success Response:**
+  *   **Status Code:** `200 OK`
+  *   **Body:**
+      ```json
+      [
+        "cloned_voice_alpha.pth",
+        "user_voice_beta.pth"
+      ]
+      ```
+
+#### `DELETE /voices/{voice_id}`
+
+*   **Description:** Delete a specific voice by its ID.
+*   **Success Response:**
+  *   **Status Code:** `200 OK`
+  *   **Body:**
+      ```json
+      {
+        "message": "Voice 'cloned_voice_alpha.pth' deleted successfully."
+      }
+      ```
+
 ## 5. Voice Management
 
 A robust strategy for managing voice files is crucial for the system's flexibility and stability.
 
 *   **Storage:** All cloned voice files (e.g., `cloned_voice_alpha.pth`, `user_voice_beta.pth`) will be stored in a directory within the container located at `/voices`. This directory will be mapped to a RunPod persistent network volume during deployment. This ensures that uploaded voices are not lost when the pod is stopped.
 *   **Loading Strategy:** A lazy-loading mechanism will be implemented.
-    1.  On startup, the application will scan the `/voices` directory and create a list of available `voice_id`s based on the filenames.
-    2.  When a request for a specific `voice_id` is received, the server first checks if the corresponding voice model is already loaded in memory (in a cache).
-    3.  If not, it loads the voice file from the `/voices` directory into GPU memory and adds it to the cache.
-    4.  This approach conserves memory by only loading the voices that are actively being used.
+  1.  On startup, the application will scan the `/voices` directory and create a list of available `voice_id`s based on the filenames.
+  2.  When a request for a specific `voice_id` is received, the server first checks if the corresponding voice model is already loaded in memory (in a cache).
+  3.  If not, it loads the voice file from the `/voices` directory into GPU memory and adds it to the cache.
+  4.  This approach conserves memory by only loading the voices that are actively being used.
 *   **Access:** The `voice_id` provided in the API request directly maps to the filename of the voice model (e.g., `voice_id: "cloned_voice_alpha"` maps to the file `/voices/cloned_voice_alpha.pth`).
 
 ## 6. Voice Cloning Workflow
@@ -244,5 +298,4 @@ This section provides a step-by-step guide for deploying the Chatterbox TTS serv
 
 6.  **Test the Service:**
     *   Find the public URL for your service in the RunPod "My Pods" dashboard.
-    *   Use a WebSocket client (e.g., a simple Python script or a web-based tool) to connect to `ws://<your-runpod-url>/tts/stream`.
-    *   Send a JSON request and verify that you receive streaming audio in response.
+    *   Use a tool like `curl` to send a request to the `/tts/generate` endpoint and verify that you receive an audio file in response.
