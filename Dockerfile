@@ -21,9 +21,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
+# Copy source code and scripts
 COPY ./src ./src
 COPY ./static ./static
+COPY ./scripts ./scripts
+COPY run.py .
+
+# Download models
+RUN python3 scripts/download_models.py
 
 # Stage 2: Production Environment
 # Use a smaller -runtime image which only includes the CUDA runtime
@@ -38,14 +43,17 @@ RUN useradd --create-home appuser
 USER appuser
 WORKDIR /home/appuser
 
-# Copy the virtual environment and source code from the builder stage
+# Copy the virtual environment, source code, and models from the builder stage
 COPY --from=builder /app/venv ./venv
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/static ./static
+COPY --from=builder /app/models ./models
+COPY --from=builder /app/run.py .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/home/appuser/venv/bin:$PATH"
+ENV MODEL_PATH="/home/appuser/models"
 
 # Expose the application port
 EXPOSE 8000
@@ -55,5 +63,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Define the command to run the application
-# The working directory is now /home/appuser, so the path to the app is src.main:app
-CMD ["python3", "-m", "uvicorn", "--host", "0.0.0.0", "--port", "8000", "src.main:app"]
+CMD ["python3", "run.py"]

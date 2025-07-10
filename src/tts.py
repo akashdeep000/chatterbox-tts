@@ -22,7 +22,10 @@ class TextToSpeechEngine:
             print("Warning: MPS is not available, falling back to CPU.")
             device = "cpu"
         self.device = device
-        self.tts = ChatterboxTTS.from_pretrained(device=device)
+        self.tts = ChatterboxTTS.from_pretrained(
+            settings.MODEL_PATH,
+            device=device
+        )
         self.voice_manager = VoiceManager()
         self.watermarker = perth.PerthImplicitWatermarker()
         print("TTS Engine Initialized.")
