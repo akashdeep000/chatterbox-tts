@@ -1,15 +1,20 @@
-# Stage 1: Builder Environment
-# Use a -devel image which includes the full CUDA toolkit and compilers
-FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 AS builder
+# Stage 1: Production Environment
+# Use a single-stage build with the runtime image
+FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# Install Python and system dependencies
+# Install system dependencies, Python, and build tools.
+# The runtime image may not have all the tools needed to build python packages,
+# so we install build-essential.
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-venv \
-    libsndfile1 && \
+    libsndfile1 \
+    libgomp1 \
+    curl \
+    build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 # Create and activate a virtual environment
@@ -26,29 +31,18 @@ COPY ./src ./src
 COPY ./static ./static
 COPY ./scripts ./scripts
 COPY run.py .
+COPY models ./models
 
-# Download models
+# Download models if they don't exist
 RUN python3 scripts/download_models.py
-
-# Stage 2: Production Environment
-# Use a smaller -runtime image which only includes the CUDA runtime
-FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
-
-# Install python3 in the production image
-USER root
-RUN apt-get update && apt-get install -y python3 libgomp1 curl && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security
 RUN useradd --create-home appuser
 USER appuser
 WORKDIR /home/appuser
 
-# Copy the virtual environment, source code, and models from the builder stage
-COPY --from=builder /app/venv ./venv
-COPY --from=builder /app/src ./src
-COPY --from=builder /app/static ./static
-COPY --from=builder /app/models ./models
-COPY --from=builder /app/run.py .
+# Copy the application from /app to the user's home directory
+COPY --from=0 /app .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
