@@ -128,122 +128,30 @@ document.addEventListener('DOMContentLoaded', () => {
         stopTtsButton.disabled = true;
     }
 
-    async function generateTtsRest() {
+    function generateTtsRest() {
         if (!apiKey || !ttsTextInput.value || !ttsVoiceSelect.value) return;
 
-        abortController = new AbortController();
         generateTtsButton.textContent = 'Generating...';
         generateTtsButton.disabled = true;
         stopTtsButton.disabled = false;
         streamingLog.innerHTML = '';
 
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        let audioQueue = [];
-        let isPlaying = false;
-        let wavHeader = null;
-        const MIN_BUFFER_SIZE = 24000; // Buffer at least this many bytes before playing
-        let dataBuffer = new Uint8Array(0);
-        let allChunks = [];
+        const url = new URL('/tts/generate', window.location.origin);
+        url.searchParams.append('text', ttsTextInput.value);
+        url.searchParams.append('voice_id', ttsVoiceSelect.value);
+        url.searchParams.append('api_key', apiKey);
 
-        function playFromQueue() {
-            if (isPlaying || audioQueue.length === 0) return;
+        ttsAudio.src = url.toString();
+        ttsAudio.play();
 
-            isPlaying = true;
-            const bufferToPlay = audioQueue.shift();
-            const source = audioContext.createBufferSource();
-            source.buffer = bufferToPlay;
-            source.connect(audioContext.destination);
-            source.onended = () => {
-                isPlaying = false;
-                playFromQueue();
-            };
-            source.start();
-        }
-
-        try {
-            const response = await fetch('/tts/generate', {
-                method: 'POST',
-                headers: {
-                    'X-API-Key': apiKey,
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    text: ttsTextInput.value,
-                    voice_id: ttsVoiceSelect.value
-                }),
-                signal: abortController.signal
-            });
-
-            if (!response.ok) {
-                throw new Error(`Failed to generate TTS: ${response.statusText}`);
-            }
-
-            const reader = response.body.getReader();
-
-            // Read header
-            const { value: headerChunk, done: headerDone } = await reader.read();
-            if (headerDone || headerChunk.length !== 44) {
-                console.error("Stream did not start with a 44-byte WAV header.");
-                return;
-            }
-            wavHeader = headerChunk;
-
-            while (true) {
-                const { done, value: newChunk } = await reader.read();
-
-                if (newChunk) {
-                    allChunks.push(newChunk);
-                    // Append new data to our main buffer
-                    const newBuffer = new Uint8Array(dataBuffer.length + newChunk.length);
-                    newBuffer.set(dataBuffer, 0);
-                    newBuffer.set(newChunk, dataBuffer.length);
-                    dataBuffer = newBuffer;
-                }
-
-                // If we have enough data in the buffer, or if the stream is done, process a segment
-                if (dataBuffer.length >= MIN_BUFFER_SIZE || (done && dataBuffer.length > 0)) {
-                    const segmentToProcess = dataBuffer;
-                    dataBuffer = new Uint8Array(0); // Clear the buffer
-
-                    const logEntry = document.createElement('p');
-                    logEntry.textContent = `Processing segment of size: ${segmentToProcess.length}`;
-                    streamingLog.appendChild(logEntry);
-
-                    // Create a valid WAV file for this segment
-                    const wavFileSegment = new ArrayBuffer(wavHeader.length + segmentToProcess.length);
-                    const view = new Uint8Array(wavFileSegment);
-                    view.set(wavHeader, 0);
-                    view.set(segmentToProcess, wavHeader.length);
-
-                    const dataView = new DataView(wavFileSegment);
-                    dataView.setUint32(4, 36 + segmentToProcess.length, true);
-                    dataView.setUint32(40, segmentToProcess.length, true);
-
-                    try {
-                        const decodedBuffer = await audioContext.decodeAudioData(wavFileSegment);
-                        audioQueue.push(decodedBuffer);
-                        playFromQueue();
-                    } catch (e) {
-                        console.error("Error decoding audio segment", e);
-                        break;
-                    }
-                }
-
-                if (done) {
-                    const blob = new Blob([wavHeader, ...allChunks], { type: 'audio/wav' });
-                    const audioUrl = URL.createObjectURL(blob);
-                    ttsAudio.src = audioUrl;
-                    resetTtsControls();
-                    break;
-                }
-            }
-        } catch (error) {
-            if (error.name !== 'AbortError') {
-                console.error(error);
-                showMessage(error.message, 'error');
-            }
+        ttsAudio.onended = () => {
             resetTtsControls();
-        }
+        };
+
+        ttsAudio.onerror = () => {
+            showMessage('Failed to play audio.', 'error');
+            resetTtsControls();
+        };
     }
 
     generateTtsButton.addEventListener('click', () => {
@@ -251,9 +159,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     stopTtsButton.addEventListener('click', () => {
-        if (abortController) {
-            abortController.abort();
-        }
+        ttsAudio.pause();
+        ttsAudio.src = ""; // Stop the stream
+        resetTtsControls();
     });
 
     if (apiKey) {

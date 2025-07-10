@@ -20,7 +20,6 @@ Before running the application, you must configure the following environment var
 *   `API_KEY`: **(Required)** Your secret API key for securing the service.
 *   `CORS_ORIGINS`: A comma-separated list of allowed origins (e.g., `"http://localhost:3000,https://your-frontend.com"`). Defaults to `*` (all origins).
 *   `LOG_LEVEL`: The logging level (e.g., `INFO`, `DEBUG`). Defaults to `INFO`.
-*   `MODEL_DEVICE`: The device for the TTS model (`cpu`, `cuda`). Defaults to `cpu`.
 
 ### Example `.env` file:
 
@@ -67,22 +66,21 @@ The `voice_id` for your new voice will be the filename (e.g., `voice.wav`).
 
 ## API Usage
 
-### REST API: `/tts/generate`
+### TTS Generation: `/tts/generate`
 
-This endpoint streams the generated audio, making it suitable for real-time applications.
+This endpoint generates and streams audio in real-time. It supports both `GET` and `POST` requests, providing flexibility for different use cases.
 
-**Example with `curl` (default voice):**
+#### Authentication
 
-```bash
-curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <YOUR_API_KEY>" \
-  -d '{"text": "Hello, world!"}' \
-  http://localhost:8000/tts/generate --output output.wav
-```
+For all requests to this endpoint, the API key can be provided in one of two ways:
+*   **Header:** `X-API-Key: <YOUR_API_KEY>`
+*   **Query Parameter:** `?api_key=<YOUR_API_KEY>`
 
-**Example with `curl` (custom voice):**
+#### POST Request
 
+This method is suitable for server-to-server communication or when the text is long.
+
+**Example with `curl`:**
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -91,15 +89,26 @@ curl -X POST \
   http://localhost:8000/tts/generate --output custom_voice_output.wav
 ```
 
-**Live Demo Example:**
+#### GET Request
 
+This method is ideal for use in web browsers, as it allows you to set the endpoint URL directly as the `src` of an `<audio>` tag.
+
+**Example with `curl`:**
 ```bash
-curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: <YOUR_API_KEY>" \
-  -d '{"text": "Hello, this is a test of the live demo."}' \
-  http://localhost:8000/tts/generate --output demo_output.wav
+curl -X GET "http://localhost:8000/tts/generate?text=Hello%20world&voice_id=your_voice.wav&api_key=<YOUR_API_KEY>" --output output.wav
 ```
+
+**Example in HTML:**
+```html
+<audio controls src="http://localhost:8000/tts/generate?text=Hello%20world&api_key=<YOUR_API_KEY>"></audio>
+```
+
+### Performance Optimizations
+
+The TTS engine is optimized for real-time performance through several mechanisms:
+*   **Model Pre-compilation:** The underlying TTS model is pre-compiled when the service starts, reducing latency on all subsequent requests.
+*   **Voice Caching:** When a custom voice is used for the first time, its audio characteristics are processed and cached. Subsequent requests with the same voice will use the cached data, resulting in significantly faster audio generation.
+*   **Cache Invalidation:** The voice cache is automatically cleared when a voice is updated or deleted, ensuring that the most up-to-date voice data is always used.
 
 
 ### Voice Management API

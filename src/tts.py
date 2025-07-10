@@ -14,21 +14,44 @@ import perth
 class TextToSpeechEngine:
     def __init__(self):
         print("Initializing TTS Engine...")
-        device = settings.MODEL_DEVICE
-        if device == "cuda" and not torch.cuda.is_available():
-            print("Warning: CUDA is not available, falling back to CPU.")
-            device = "cpu"
-        elif device == "mps" and not torch.backends.mps.is_available():
-            print("Warning: MPS is not available, falling back to CPU.")
-            device = "cpu"
-        self.device = device
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+        print(f"TTS Engine using device: {self.device}")
         self.tts = ChatterboxTTS.from_local(
             settings.MODEL_PATH,
             device=device
         )
         self.voice_manager = VoiceManager()
         self.watermarker = perth.PerthImplicitWatermarker()
+        self.voice_cache = {}
+        self._precompile_model()
         print("TTS Engine Initialized.")
+
+    def _precompile_model(self):
+        """
+        Pre-compile parts of the model that are voice-independent.
+        """
+        from chatterbox.models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
+        if not getattr(self.tts.t3, 'patched_model', False):
+            print("Patching model with T3HuggingfaceBackend...")
+            self.tts.t3.patched_model = T3HuggingfaceBackend(
+                self.tts.t3.cfg, self.tts.t3.tfmr,
+                speech_enc=self.tts.t3.speech_emb, speech_head=self.tts.t3.speech_head
+            )
+            print("Model patched.")
+
+    def clear_voice_cache(self, voice_id: str):
+        """
+        Clear a specific voice from the cache.
+        """
+        voice_path = self.voice_manager.get_voice_path(voice_id)
+        if voice_path in self.voice_cache:
+            del self.voice_cache[voice_path]
+            print(f"Cache cleared for voice: {voice_id}")
 
     def _punc_norm(self, text: str) -> str:
         if len(text) == 0:
@@ -63,8 +86,11 @@ class TextToSpeechEngine:
             yield audio_bytes
 
     def _generate_stream(self, text: str, audio_prompt_path: Optional[str] = None, **kwargs):
-        if audio_prompt_path:
+        if audio_prompt_path in self.voice_cache:
+            self.tts.conds = self.voice_cache[audio_prompt_path]
+        elif audio_prompt_path:
             self.tts.prepare_conditionals(audio_prompt_path)
+            self.voice_cache[audio_prompt_path] = self.tts.conds
 
         text = self._punc_norm(text)
         text_tokens = self.tts.tokenizer.text_to_tokens(text).to(self.device)
@@ -94,16 +120,6 @@ class TextToSpeechEngine:
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
         initial_speech_tokens = self.tts.t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
         embeds, len_cond = self.tts.t3.prepare_input_embeds(t3_cond=t3_cond, text_tokens=text_tokens, speech_tokens=initial_speech_tokens)
-
-        if not getattr(self.tts.t3, 'compiled', False):
-            from chatterbox.models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
-            from chatterbox.models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
-            alignment_analyzer = AlignmentStreamAnalyzer(self.tts.t3.tfmr, None, (len_cond, len_cond + text_tokens.size(-1)), 9, self.tts.t3.hp.stop_speech_token)
-            self.tts.t3.patched_model = T3HuggingfaceBackend(
-                self.tts.t3.cfg, self.tts.t3.tfmr,
-                speech_enc=self.tts.t3.speech_emb, speech_head=self.tts.t3.speech_head
-            )
-            self.tts.t3.compiled = True
 
         bos_token = torch.tensor([[self.tts.t3.hp.start_speech_token]], dtype=torch.long, device=self.device)
         bos_embed = self.tts.t3.speech_emb(bos_token) + self.tts.t3.speech_pos_emb.get_fixed_embedding(0)

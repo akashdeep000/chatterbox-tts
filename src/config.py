@@ -15,7 +15,6 @@ class AppConfig(BaseSettings):
 
     # TTS and Voice settings
     VOICES_DIR: str = "voices/"
-    MODEL_DEVICE: str = "cpu"  # Default to CPU, can be overridden
     MODEL_PATH: str = "models"
 
     # Security
