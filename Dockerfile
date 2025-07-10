@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 \
     libgomp1 \
     curl \
-    build-essential &&
+    build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 # Create and activate a virtual environment
@@ -23,7 +23,7 @@ ENV PATH="/app/venv/bin:$PATH"
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip &&
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy source code and scripts
