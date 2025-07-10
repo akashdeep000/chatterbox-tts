@@ -29,6 +29,10 @@ COPY ./static ./static
 # Use a smaller -runtime image which only includes the CUDA runtime
 FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 
+# Install python3 in the production image
+USER root
+RUN apt-get update && apt-get install -y python3 && rm -rf /var/lib/apt/lists/*
+
 # Create a non-root user for security
 RUN useradd --create-home appuser
 USER appuser
