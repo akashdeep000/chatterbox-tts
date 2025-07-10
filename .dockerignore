@@ -12,7 +12,6 @@ Dockerfile
 __pycache__/
 
 # Local development
-run.py
 .env
 
 # Documentation and temporary files
