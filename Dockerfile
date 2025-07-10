@@ -9,7 +9,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-venv \
-    libsndfile1 &&
+    libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create and activate a virtual environment
@@ -18,7 +18,7 @@ ENV PATH="/app/venv/bin:$PATH"
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip &&
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
