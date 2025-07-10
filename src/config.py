@@ -27,6 +27,7 @@ class AppConfig(BaseSettings):
         # Load from a .env file if it exists
         env_file = ".env"
         env_file_encoding = 'utf-8'
+        extra = 'ignore'
 
 # Instantiate the config object to be used across the application
 settings = AppConfig()

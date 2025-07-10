@@ -23,7 +23,7 @@ class TextToSpeechEngine:
         print(f"TTS Engine using device: {self.device}")
         self.tts = ChatterboxTTS.from_local(
             settings.MODEL_PATH,
-            device=device
+            device=self.device
         )
         self.voice_manager = VoiceManager()
         self.watermarker = perth.PerthImplicitWatermarker()
