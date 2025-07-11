@@ -39,7 +39,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY ./src ./src
 COPY ./static ./static
 COPY ./scripts ./scripts
-COPY ./voices ./voices
+COPY ./preloaded-voices ./preloaded-voices
 COPY run.py .
 
 # Download models

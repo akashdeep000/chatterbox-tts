@@ -134,5 +134,7 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Voice files
+voices/
 # Models
 models/

@@ -15,6 +15,7 @@ class AppConfig(BaseSettings):
 
     # TTS and Voice settings
     VOICES_DIR: str = "voices/"
+    PRELOADED_VOICES_DIR: str = "preloaded-voices/"
     MODEL_PATH: str = "models"
 
     # Security
