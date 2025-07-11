@@ -69,6 +69,73 @@ class TextToSpeechEngine:
         if not any(text.endswith(p) for p in {".", "!", "?", "-", ","}):
             text += "."
         return text
+    def _split_text(self, text: str, max_length: int = 400) -> list:
+        """Split text into manageable chunks for TTS processing."""
+        if len(text) <= max_length:
+            return [text]
+
+        # Try to split at sentence boundaries first
+        sentence_endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
+        chunks = []
+        current_chunk = ""
+
+        # Split into sentences
+        sentences = []
+        temp_text = text
+
+        while temp_text:
+            best_split = len(temp_text)
+
+            for ending in sentence_endings:
+                pos = temp_text.find(ending)
+                if pos != -1 and pos < best_split:
+                    best_split = pos + len(ending)
+
+            if best_split == len(temp_text):
+                # No sentence ending found, take the rest
+                sentences.append(temp_text)
+                break
+            else:
+                sentences.append(temp_text[:best_split])
+                temp_text = temp_text[best_split:]
+
+        # Group sentences into chunks
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            if len(current_chunk) + len(sentence) <= max_length:
+                current_chunk += (" " if current_chunk else "") + sentence
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+
+                # If single sentence is too long, split it further
+                if len(sentence) > max_length:
+                    # Last resort: split by words
+                    words = sentence.split()
+                    current_word_chunk = ""
+                    for word in words:
+                        if len(current_word_chunk) + len(word) + 1 <= max_length:
+                            current_word_chunk += (" " if current_word_chunk else "") + word
+                        else:
+                            if current_word_chunk:
+                                chunks.append(current_word_chunk)
+                            current_word_chunk = word
+                    if current_word_chunk:
+                        chunks.append(current_word_chunk)
+                    current_chunk = ""
+                else:
+                    current_chunk = sentence
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        # Filter out empty chunks
+        chunks = [chunk for chunk in chunks if chunk.strip()]
+
+        return chunks
 
     def stream(self, text: str, voice_id: str = None):
         print(f"Streaming audio for text: '{text}'")
@@ -77,21 +144,29 @@ class TextToSpeechEngine:
         header = self._create_wav_header(self.tts.sr)
         yield header
 
-        for audio_chunk, _ in self._generate_stream(text, audio_prompt_path):
-            # Convert the torch tensor to a numpy array, then to bytes (signed 16-bit PCM)
-            # Ensure the audio_chunk is on CPU and converted to the correct data type
-            audio_np = audio_chunk.cpu().squeeze(0).numpy()
-            # Convert to signed 16-bit integers
-            audio_bytes = (audio_np * 32767).astype(np.int16).tobytes()
-            yield audio_bytes
+        text_chunks = self._split_text(text)
+        print(f"Split text into {len(text_chunks)} chunks.")
+
+        # Prepare voice conditionals once before streaming
+        if audio_prompt_path:
+            if audio_prompt_path not in self.voice_cache:
+                print(f"Preparing new voice conditionals for: {audio_prompt_path}")
+                self.tts.prepare_conditionals(audio_prompt_path)
+                self.voice_cache[audio_prompt_path] = self.tts.conds
+            else:
+                print(f"Using cached voice conditionals for: {audio_prompt_path}")
+            self.tts.conds = self.voice_cache[audio_prompt_path]
+
+        for i, chunk in enumerate(text_chunks):
+            print(f"Generating audio for chunk {i+1}/{len(text_chunks)}: '{chunk}'")
+            for audio_chunk, _ in self._generate_stream(chunk, audio_prompt_path):
+                # Convert the torch tensor to a numpy array, then to bytes (signed 16-bit PCM)
+                audio_np = audio_chunk.cpu().squeeze(0).numpy()
+                # Convert to signed 16-bit integers
+                audio_bytes = (audio_np * 32767).astype(np.int16).tobytes()
+                yield audio_bytes
 
     def _generate_stream(self, text: str, audio_prompt_path: Optional[str] = None, **kwargs):
-        if audio_prompt_path in self.voice_cache:
-            self.tts.conds = self.voice_cache[audio_prompt_path]
-        elif audio_prompt_path:
-            self.tts.prepare_conditionals(audio_prompt_path)
-            self.voice_cache[audio_prompt_path] = self.tts.conds
-
         text = self._punc_norm(text)
         text_tokens = self.tts.tokenizer.text_to_tokens(text).to(self.device)
         text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
