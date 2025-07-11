@@ -10,6 +10,7 @@ import numpy as np
 import torch.nn.functional as F
 from chatterbox.models.s3tokenizer import drop_invalid_tokens
 import perth
+import re
 
 class TextToSpeechEngine:
     def __init__(self):
@@ -70,6 +71,13 @@ class TextToSpeechEngine:
             text += "."
         return text
 
+    def _split_into_sentences(self, text: str):
+        """
+        Split text into sentences.
+        """
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s.strip() for s in sentences if s.strip()]
+
     def stream(self, text: str, voice_id: str = None):
         print(f"Streaming audio for text: '{text}'")
         audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
@@ -92,27 +100,33 @@ class TextToSpeechEngine:
             self.tts.prepare_conditionals(audio_prompt_path)
             self.voice_cache[audio_prompt_path] = self.tts.conds
 
-        text = self._punc_norm(text)
-        text_tokens = self.tts.tokenizer.text_to_tokens(text).to(self.device)
-        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
-        sot, eot = self.tts.t3.hp.start_text_token, self.tts.t3.hp.stop_text_token
-        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
-
+        sentences = self._split_into_sentences(text)
         all_tokens_processed = []
-        with torch.inference_mode():
-            for token_chunk in self._inference_stream(t3_cond=self.tts.conds.t3, text_tokens=text_tokens, **kwargs):
-                token_chunk = token_chunk[0]
-                audio_tensor, _, success = self._process_token_buffer(
-                    [token_chunk], all_tokens_processed, 50, fade_duration=0.05
-                )
-                if success:
-                    yield audio_tensor, None
+        sot, eot = self.tts.t3.hp.start_text_token, self.tts.t3.hp.stop_text_token
 
-                if len(all_tokens_processed) == 0:
-                    all_tokens_processed = token_chunk
-                else:
-                    all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
+        with torch.inference_mode():
+            for sentence in sentences:
+                sentence = self._punc_norm(sentence)
+                if not sentence:
+                    continue
+
+                text_tokens = self.tts.tokenizer.text_to_tokens(sentence).to(self.device)
+                text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+                text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+                text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+                for token_chunk in self._inference_stream(t3_cond=self.tts.conds.t3, text_tokens=text_tokens, **kwargs):
+                    token_chunk = token_chunk[0]
+                    audio_tensor, _, success = self._process_token_buffer(
+                        [token_chunk], all_tokens_processed, 50, fade_duration=0.05
+                    )
+                    if success:
+                        yield audio_tensor, None
+
+                    if len(all_tokens_processed) == 0:
+                        all_tokens_processed = token_chunk
+                    else:
+                        all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
 
     def _inference_stream(self, t3_cond, text_tokens, max_new_tokens=1000, temperature=0.8, cfg_weight=0.5, chunk_size=25):
         from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor
@@ -159,8 +173,6 @@ class TextToSpeechEngine:
             past = output.past_key_values
 
     def _process_token_buffer(self, token_buffer, all_tokens_so_far, context_window, fade_duration=0.02):
-        new_tokens = torch.cat(token_buffer, dim=-1)
-        context_tokens = all_tokens_so_far[-context_window:] if len(all_tokens_so_far) > context_window else all_tokens_so_far
         new_tokens = torch.cat(token_buffer, dim=-1)
         context_tokens = all_tokens_so_far[-context_window:] if len(all_tokens_so_far) > context_window else all_tokens_so_far
         tokens_to_process = torch.cat([context_tokens, new_tokens], dim=-1) if len(all_tokens_so_far) > 0 else new_tokens
