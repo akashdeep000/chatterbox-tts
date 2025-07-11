@@ -14,12 +14,12 @@ RUN apt-get update && apt-get install -y \
     libsndfile1 \
     libgomp1 \
     curl \
-    build-essential &&
+    build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user and set up the app directory
-RUN useradd --create-home appuser &&
-    mkdir -p /app/voices &&
+RUN useradd --create-home appuser && \
+    mkdir -p /app/voices && \
     chown -R appuser:appuser /app
 
 # Switch to the non-root user
@@ -32,7 +32,7 @@ ENV PATH="/app/venv/bin:$PATH"
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip &&
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy source code and scripts
