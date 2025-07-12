@@ -336,8 +336,8 @@ class TextToSpeechEngine:
         temperature: float = 0.8,
         text_chunk_size: Optional[int] = 100,
         tokens_per_slice: Optional[int] = 25,
-        remove_milliseconds: int = 45,
-        remove_milliseconds_start: int = 25,
+        remove_milliseconds: int = 25,
+        remove_milliseconds_start: int = 15,
         start_time: Optional[float] = None,
     ) -> Generator[bytes, None, None]:
         audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
