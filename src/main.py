@@ -106,7 +106,8 @@ async def tts_generate(request: Request, tts_engine: TextToSpeechEngine = Depend
 
     try:
         logger.info(f"Received TTS request for voice_id: {voice_id}")
-        audio_stream = tts_engine.stream(text=text, voice_id=voice_id)
+        start_time = time.time()
+        audio_stream = tts_engine.stream(text=text, voice_id=voice_id, start_time=start_time)
         return StreamingResponse(audio_stream, media_type="audio/wav")
     except Exception as e:
         logger.error(f"TTS generation failed: {e}", exc_info=True)

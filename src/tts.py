@@ -13,9 +13,11 @@ from typing import Literal, Optional, Generator
 import io
 import gc
 import asyncio
+import time
 import functools
+import logging
 
-# Third-party imports
+ # Third-party imports
 import librosa
 import torch
 import torch.nn.functional as F
@@ -36,6 +38,10 @@ from chatterbox.tts import ChatterboxTTS as OriginalChatterboxTTS
 from .config import settings
 from .voice_manager import VoiceManager
 from .text_processing import split_text_into_chunks, punc_norm
+
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,7 +113,7 @@ class TextToSpeechEngine:
         Initializes the TTS engine, loads models, and sets the computation device.
         It automatically detects and uses CUDA or MPS if available, otherwise falls back to CPU.
         """
-        print("Initializing TTS Engine...")
+        logger.info("Initializing TTS Engine...")
         # Auto-detect best available device
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -115,7 +121,7 @@ class TextToSpeechEngine:
             self.device = "mps"
         else:
             self.device = "cpu"
-        print(f"TTS Engine using device: {self.device}")
+        logger.info(f"TTS Engine using device: {self.device}")
 
         # Load the core ChatterboxTTS model from a local path
         self.tts = OriginalChatterboxTTS.from_local(
@@ -130,7 +136,7 @@ class TextToSpeechEngine:
         self._cached_audio_prompt_path: Optional[str] = None
         # Set the sample rate from the model configuration
         self.sr = self.tts.sr
-        print("TTS Engine Initialized.")
+        logger.info("TTS Engine Initialized.")
 
     def clear_voice_cache(self, voice_id: Optional[str] = None):
         """
@@ -140,11 +146,11 @@ class TextToSpeechEngine:
         if voice_id:
             if voice_id in self.voice_cache:
                 del self.voice_cache[voice_id]
-                print(f"INFO: Voice '{voice_id}' cleared from cache.")
+                logger.info(f"Voice '{voice_id}' cleared from cache.")
         else:
             self.voice_cache.clear()
             self._cached_audio_prompt_path = None
-            print("INFO: Voice cache cleared.")
+            logger.info("Voice cache cleared.")
 
     def prepare_conditionals(self, wav_fpath: str, exaggeration: float = 0.5):
         """
@@ -188,7 +194,7 @@ class TextToSpeechEngine:
         voice_id = Path(wav_fpath).name
         self.voice_cache[voice_id] = Conditionals(t3_cond, s3gen_ref_dict)
         self._cached_audio_prompt_path = str(Path(wav_fpath).resolve())
-        print(f"INFO: Conditionals processed and cached for voice: {voice_id}")
+        logger.info(f"Conditionals processed and cached for voice: {voice_id}")
 
     async def generate(
         self,
@@ -203,10 +209,10 @@ class TextToSpeechEngine:
         chunk_overlap_method: Literal["zero", "full"] = "zero",
     ) -> Generator[torch.Tensor, None, None]:
         voice_id = Path(audio_prompt_path).name if audio_prompt_path else "default"
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         if audio_prompt_path and voice_id not in self.voice_cache:
-            print(f"INFO: Voice '{voice_id}' not in cache. Processing: {audio_prompt_path}")
+            logger.info(f"Voice '{voice_id}' not in cache. Processing: {audio_prompt_path}")
             await loop.run_in_executor(None, self.prepare_conditionals, audio_prompt_path, exaggeration)
 
         conds = self.voice_cache.get(voice_id)
@@ -219,7 +225,7 @@ class TextToSpeechEngine:
 
         current_exaggeration_tensor = exaggeration * torch.ones(1, 1, 1, device=self.device)
         if not torch.equal(conds.t3.emotion_adv, current_exaggeration_tensor):
-            print(f"INFO: Updating emotion exaggeration to: {exaggeration}")
+            logger.info(f"Updating emotion exaggeration to: {exaggeration}")
             _cond: T3Cond = conds.t3
             conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
@@ -228,7 +234,9 @@ class TextToSpeechEngine:
             ).to(device=self.device)
 
         text = punc_norm(text)
-        text_tokens = await loop.run_in_executor(None, self.tts.tokenizer.text_to_tokens, text)
+        text_tokens = await loop.run_in_executor(
+            None, self.tts.tokenizer.text_to_tokens, text
+        )
         text_tokens = text_tokens.to(self.device)
 
 
@@ -249,7 +257,9 @@ class TextToSpeechEngine:
                     temperature=temperature,
                     cfg_weight=cfg_weight,
                 )
-                tokens_tensor = await loop.run_in_executor(None, partial_inference)
+                tokens_tensor = await loop.run_in_executor(
+                    None, partial_inference
+                )
                 for token in tokens_tensor:
                     yield token
 
@@ -264,7 +274,9 @@ class TextToSpeechEngine:
                     speech_tokens=speech_tokens,
                     ref_dict=conds.gen
                 )
-                wav, _ = await loop.run_in_executor(None, partial_inference)
+                wav, _ = await loop.run_in_executor(
+                    None, partial_inference
+                )
 
                 wav_gpu = wav.squeeze(0).detach()
 
@@ -322,6 +334,7 @@ class TextToSpeechEngine:
         tokens_per_slice: Optional[int] = 25,
         remove_milliseconds: int = 45,
         remove_milliseconds_start: int = 25,
+        start_time: Optional[float] = None,
     ) -> Generator[bytes, None, None]:
         audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
 
@@ -329,10 +342,12 @@ class TextToSpeechEngine:
         yield header
 
         text_chunks = split_text_into_chunks(text, text_chunk_size)
-        print(f"Streaming {len(text_chunks)} text chunks.")
+        logger.info(f"Streaming {len(text_chunks)} text chunks.")
+
+        first_chunk_generated = False
 
         for i, chunk in enumerate(text_chunks):
-            print(f"Generating audio for chunk {i+1}/{len(text_chunks)}")
+            logger.debug(f"Generating audio for chunk {i+1}/{len(text_chunks)}")
 
             # Generate audio for the current text chunk.
             audio_generator = self.generate(
@@ -347,6 +362,11 @@ class TextToSpeechEngine:
             )
 
             async for audio_tensor in audio_generator:
+                if not first_chunk_generated and start_time:
+                    ttfb = time.time() - start_time
+                    logger.info(f"Time to first audio chunk: {ttfb:.4f}s")
+                    first_chunk_generated = True
+
                 if audio_tensor is not None and audio_tensor.numel() > 0:
                     if hasattr(audio_tensor, 'cpu'):
                         audio_tensor = audio_tensor.cpu()
