@@ -25,43 +25,8 @@ def punc_norm(text: str) -> str:
         text += "."
     return text
 
-def split_text_for_streaming(text: str, chunk_size: int = 25) -> List[str]:
-    """
-    Splits text into chunks by word boundaries for low-latency streaming.
-    """
-    words = text.split()
-    if not words:
-        return []
-
-    chunks = []
-    current_chunk = ""
-
-    for word in words:
-        if len(current_chunk) + len(word) + 1 <= chunk_size:
-            if current_chunk:
-                current_chunk += " " + word
-            else:
-                current_chunk = word
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-
-            if len(word) > chunk_size:
-                for i in range(0, len(word), chunk_size):
-                    chunks.append(word[i:i + chunk_size])
-                current_chunk = ""
-            else:
-                current_chunk = word
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
 def split_text_into_chunks(text: str, max_length: int = None) -> list:
     """Split text into manageable chunks for TTS processing"""
-    if max_length is None:
-        max_length = Config.MAX_CHUNK_LENGTH
 
     if len(text) <= max_length:
         return [text]

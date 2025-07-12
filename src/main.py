@@ -94,6 +94,7 @@ async def tts_generate(request: Request, tts_engine: TextToSpeechEngine = Depend
             body = await request.json()
             text = body.get("text")
             voice_id = body.get("voice_id")
+            chunk_size = body.get("chunk_size")
         except Exception:
             return JSONResponse(content={"error": "Invalid JSON body"}, status_code=400)
     else:  # GET request
