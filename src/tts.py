@@ -207,7 +207,7 @@ class TextToSpeechEngine:
         remove_milliseconds: int = 45,
         remove_milliseconds_start: int = 25,
         chunk_overlap_method: Literal["zero", "full"] = "zero",
-    ) -> Generator[np.ndarray, None, None]:
+    ) -> Generator[torch.Tensor, None, None]:
         voice_id = Path(audio_prompt_path).name if audio_prompt_path else "default"
         loop = asyncio.get_running_loop()
 
@@ -269,32 +269,32 @@ class TextToSpeechEngine:
                 speech_tokens = drop_invalid_tokens(speech_tokens)
                 speech_tokens = speech_tokens[speech_tokens < 6561].to(self.device)
 
+                if speech_tokens.shape[-1] < 3:
+                    padding_needed = 3 - speech_tokens.shape[-1]
+                    speech_tokens = torch.nn.functional.pad(speech_tokens, (0, padding_needed), "constant", 0)
+
                 partial_inference = functools.partial(
                     self.tts.s3gen.inference,
                     speech_tokens=speech_tokens,
                     ref_dict=conds.gen
                 )
-                if self.device == "cuda":
-                    torch.cuda.synchronize()
                 wav, _ = await loop.run_in_executor(
                     None, partial_inference
                 )
 
-                wav_cpu = wav.squeeze(0).detach().cpu()
+                wav_gpu = wav.squeeze(0).detach()
 
                 if chunk_overlap_method == "full":
-                    wav_cpu = wav_cpu[previous_length:]
+                    wav_gpu = wav_gpu[previous_length:]
 
                 if remove_milliseconds > 0:
                     trim_samples = int(self.sr * remove_milliseconds / 1000)
-                    wav_cpu = wav_cpu[:-trim_samples]
+                    wav_gpu = wav_gpu[:-trim_samples]
                 if remove_milliseconds_start > 0:
                     trim_samples_start = int(self.sr * remove_milliseconds_start / 1000)
-                    wav_cpu = wav_cpu[trim_samples_start:]
+                    wav_gpu = wav_gpu[trim_samples_start:]
 
-                new_len = wav_cpu.shape[0] + previous_length
-
-                return wav_cpu.numpy(), new_len
+                return wav_gpu.unsqueeze(0), wav_gpu.shape[0] + previous_length
 
             eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
 
@@ -365,22 +365,24 @@ class TextToSpeechEngine:
                 remove_milliseconds_start=remove_milliseconds_start,
             )
 
-            async for audio_numpy in audio_generator:
+            async for audio_tensor in audio_generator:
                 if not first_chunk_generated and start_time:
                     ttfb = time.time() - start_time
                     logger.info(f"Time to first audio chunk: {ttfb:.4f}s")
                     first_chunk_generated = True
 
-                if audio_numpy is not None and audio_numpy.size > 0:
-                    # Clamp and convert to int16
-                    audio_numpy = np.clip(audio_numpy, -1.0, 1.0)
-                    audio_int16 = (audio_numpy * 32767).astype(np.int16)
+                if audio_tensor is not None and audio_tensor.numel() > 0:
+                    if hasattr(audio_tensor, 'cpu'):
+                        audio_tensor = audio_tensor.cpu()
 
-                    pcm_data = audio_int16.tobytes()
+                    audio_tensor = torch.clamp(audio_tensor, -1.0, 1.0)
+                    audio_tensor_int = (audio_tensor * 32767).to(torch.int16)
+
+                    pcm_data = audio_tensor_int.numpy().tobytes()
                     yield pcm_data
 
-                    # Cleanup numpy arrays
-                    del audio_numpy, audio_int16, pcm_data
+                    safe_delete_tensors(audio_tensor, audio_tensor_int)
+                    del pcm_data
 
             # Perform garbage collection periodically to manage memory.
             if i > 0 and i % 3 == 0:
