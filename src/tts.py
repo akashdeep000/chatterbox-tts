@@ -124,6 +124,11 @@ class TextToSpeechEngine:
         else:
             self.device = "cpu"
 
+        self.t3_stream = None
+        self.s3gen_stream = None
+        if self.device == "cuda":
+            self.t3_stream = torch.cuda.Stream()
+            self.s3gen_stream = torch.cuda.Stream()
 
         # Load the core ChatterboxTTS model from a local path
         self.tts = OriginalChatterboxTTS.from_local(
@@ -174,25 +179,27 @@ class TextToSpeechEngine:
         voice_id = Path(wav_fpath).name
         self.voice_cache[voice_id] = Conditionals(t3_cond, s3gen_ref_dict)
 
-    def _blocking_t3_inference(self, t3_cond, text_tokens, temperature, cfg_weight):
+    def _blocking_t3_inference(self, t3_cond, text_tokens, temperature, cfg_weight, stream):
         """Runs the blocking T3 inference and returns the full token stream."""
-        t3_inference_gen = self.tts.t3.inference(
-            t3_cond=t3_cond,
-            text_tokens=text_tokens,
-            max_new_tokens=500,
-            temperature=temperature,
-            cfg_weight=cfg_weight,
-        )
-        token_stream = []
-        for speech_token_batch in t3_inference_gen:
-            token_stream.extend(speech_token_batch.squeeze(0))
-        return token_stream
+        with torch.cuda.stream(stream):
+            t3_inference_gen = self.tts.t3.inference(
+                t3_cond=t3_cond,
+                text_tokens=text_tokens,
+                max_new_tokens=500,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+            )
+            token_stream = []
+            for speech_token_batch in t3_inference_gen:
+                token_stream.extend(speech_token_batch.squeeze(0))
+            return token_stream
 
     async def _t3_producer_task(
         self,
         text_chunks: list,
         speech_token_queue: asyncio.Queue,
         params: SynthesisParams,
+        stream: torch.cuda.Stream,
     ):
         """Producer task for T3 model. Generates speech tokens and puts them into a queue."""
         num_chunks = len(text_chunks)
@@ -224,6 +231,7 @@ class TextToSpeechEngine:
                     text_tokens,
                     params.temperature,
                     params.cfg_weight,
+                    stream,
                 )
 
                 # 4. Slice the buffered tokens and queue them with metadata
@@ -255,6 +263,7 @@ class TextToSpeechEngine:
         speech_token_queue: asyncio.Queue,
         audio_chunk_queue: asyncio.Queue,
         params: SynthesisParams,
+        stream: torch.cuda.Stream,
     ):
         """Consumer task for S3Gen model. Converts speech tokens to audio chunks."""
         loop = params.loop
@@ -288,7 +297,8 @@ class TextToSpeechEngine:
                     speech_tokens=speech_tokens,
                     ref_dict=params.conds.gen
                 )
-                wav, _ = await loop.run_in_executor(None, partial_inference)
+                with torch.cuda.stream(stream):
+                    wav, _ = await loop.run_in_executor(None, partial_inference)
                 wav_gpu = wav.squeeze(0).detach()
 
                 # 3. Post-processing
@@ -374,10 +384,10 @@ class TextToSpeechEngine:
 
         # Start producer and consumer tasks
         producer_task = loop.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, params)
+            self._t3_producer_task(text_chunks, speech_token_queue, params, self.t3_stream)
         )
         consumer_task = loop.create_task(
-            self._s3gen_consumer_task(speech_token_queue, audio_chunk_queue, params)
+            self._s3gen_consumer_task(speech_token_queue, audio_chunk_queue, params, self.s3gen_stream)
         )
 
         # Stream audio chunks to the client
