@@ -34,7 +34,7 @@ from chatterbox.tts import ChatterboxTTS as OriginalChatterboxTTS
 
 from .config import settings, tts_config
 from .voice_manager import VoiceManager
-from .text_processing import split_text_into_chunks, punc_norm
+from .text_processing import split_text_into_chunks
 from .logging_config import log
 
 
@@ -431,8 +431,7 @@ class TextToSpeechEngine:
 
         yield self.audio_processor.create_wav_header(self.sr)
 
-        raw_chunks = split_text_into_chunks(text, text_chunk_size)
-        text_chunks = [punc_norm(chunk) for chunk in raw_chunks]
+        text_chunks = split_text_into_chunks(text, text_chunk_size)
         if not text_chunks:
             return
 
