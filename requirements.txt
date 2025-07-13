@@ -7,3 +7,4 @@ torchaudio
 python-dotenv
 chatterbox-tts
 python-multipart
+loguru

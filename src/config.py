@@ -1,5 +1,6 @@
 import os
 from pydantic_settings import BaseSettings
+from pydantic import BaseModel
 
 class AppConfig(BaseSettings):
     """
@@ -30,5 +31,20 @@ class AppConfig(BaseSettings):
         env_file_encoding = 'utf-8'
         extra = 'ignore'
 
-# Instantiate the config object to be used across the application
+class TTSConfig(BaseModel):
+    """
+    Default TTS parameter values.
+    """
+    exaggeration: float = 0.5
+    cfg_weight: float = 0.5
+    temperature: float = 0.8
+    text_chunk_size: int = 75
+    tokens_per_slice: int = 25
+    remove_milliseconds: int = 15
+    remove_milliseconds_start: int = 10
+    chunk_overlap_method: str = "zero"
+    enable_fp16: bool = True # Use half-precision for faster inference on compatible GPUs
+
+# Instantiate the config objects to be used across the application
 settings = AppConfig()
+tts_config = TTSConfig()

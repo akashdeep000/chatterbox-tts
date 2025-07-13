@@ -9,9 +9,11 @@ import io
 import logging
 import time
 from typing import Optional
+import asyncio
 
-from .config import settings
-from .dependencies import get_tts_engine
+from .config import settings, tts_config
+from .dependencies import get_tts_engine, get_voice_manager
+from . import dependencies
 from .tts import TextToSpeechEngine
 from .voice_manager import VoiceManager
 from fastapi import File, UploadFile
@@ -21,6 +23,36 @@ logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(debug=settings.DEBUG)
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Initializes the TTS engine on application startup.
+    """
+    logger.info("Initializing TTS engine and Voice Manager...")
+    dependencies.tts_engine = TextToSpeechEngine()
+    dependencies.voice_manager = VoiceManager()
+    logger.info("TTS engine and Voice Manager initialized successfully.")
+
+    # Warm up voice cache for all available voices
+    logger.info("Warming up voice cache...")
+    available_voices = dependencies.voice_manager.list_voices()
+    if available_voices:
+        for voice_id in available_voices:
+            try:
+                voice_path = dependencies.voice_manager.get_voice_path(voice_id)
+                if voice_path:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, dependencies.tts_engine.prepare_conditionals, voice_path)
+                    logger.info(f"Preloaded voice '{voice_id}' into cache.")
+                else:
+                    logger.warning(f"Could not find path for voice ID '{voice_id}'. Skipping.")
+            except Exception as e:
+                logger.error(f"Failed to preload voice '{voice_id}': {e}", exc_info=True)
+        logger.info("Voice cache warm-up complete.")
+    else:
+        logger.info("No voices found to preload into cache.")
+
 
 # --- Static Files ---
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -82,9 +114,20 @@ async def get_api_key(
 class TTSRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
+    exaggeration: float = tts_config.exaggeration
+    cfg_weight: float = tts_config.cfg_weight
+    temperature: float = tts_config.temperature
+    text_chunk_size: Optional[int] = tts_config.text_chunk_size
+    tokens_per_slice: Optional[int] = tts_config.tokens_per_slice
+    remove_milliseconds: int = tts_config.remove_milliseconds
+    remove_milliseconds_start: int = tts_config.remove_milliseconds_start
+    chunk_overlap_method: str = tts_config.chunk_overlap_method
 
 @app.api_route("/tts/generate", methods=["GET", "POST"], dependencies=[Depends(get_api_key)])
-async def tts_generate(request: Request, tts_engine: TextToSpeechEngine = Depends(get_tts_engine)):
+async def tts_generate(
+    request: Request,
+    tts_engine: TextToSpeechEngine = Depends(get_tts_engine)
+):
     """
     Generates and streams audio for the given text.
     Accepts both GET and POST requests.
@@ -92,22 +135,43 @@ async def tts_generate(request: Request, tts_engine: TextToSpeechEngine = Depend
     if request.method == "POST":
         try:
             body = await request.json()
-            text = body.get("text")
-            voice_id = body.get("voice_id")
-            chunk_size = body.get("chunk_size")
+            tts_request = TTSRequest(**body)
         except Exception:
             return JSONResponse(content={"error": "Invalid JSON body"}, status_code=400)
     else:  # GET request
-        text = request.query_params.get("text")
-        voice_id = request.query_params.get("voice_id")
+        query_params = request.query_params
+        tts_request = TTSRequest(
+            text=query_params.get("text"),
+            voice_id=query_params.get("voice_id"),
+            exaggeration=float(query_params.get("exaggeration", tts_config.exaggeration)),
+            cfg_weight=float(query_params.get("cfg_weight", tts_config.cfg_weight)),
+            temperature=float(query_params.get("temperature", tts_config.temperature)),
+            text_chunk_size=int(query_params.get("text_chunk_size", tts_config.text_chunk_size)),
+            tokens_per_slice=int(query_params.get("tokens_per_slice", tts_config.tokens_per_slice)),
+            remove_milliseconds=int(query_params.get("remove_milliseconds", tts_config.remove_milliseconds)),
+            remove_milliseconds_start=int(query_params.get("remove_milliseconds_start", tts_config.remove_milliseconds_start)),
+            chunk_overlap_method=query_params.get("chunk_overlap_method", tts_config.chunk_overlap_method),
+        )
 
-    if not text:
+    if not tts_request.text:
         return JSONResponse(content={"error": "Text is required"}, status_code=400)
 
     try:
-        logger.info(f"Received TTS request for voice_id: {voice_id}")
+        logger.info(f"Received TTS request for voice_id: {tts_request.voice_id}")
         start_time = time.time()
-        audio_stream = tts_engine.stream(text=text, voice_id=voice_id, start_time=start_time)
+        audio_stream = tts_engine.stream(
+            text=tts_request.text,
+            voice_id=tts_request.voice_id,
+            exaggeration=tts_request.exaggeration,
+            cfg_weight=tts_request.cfg_weight,
+            temperature=tts_request.temperature,
+            text_chunk_size=tts_request.text_chunk_size,
+            tokens_per_slice=tts_request.tokens_per_slice,
+            remove_milliseconds=tts_request.remove_milliseconds,
+            remove_milliseconds_start=tts_request.remove_milliseconds_start,
+            chunk_overlap_method=tts_request.chunk_overlap_method,
+            start_time=start_time
+        )
         return StreamingResponse(audio_stream, media_type="audio/wav")
     except Exception as e:
         logger.error(f"TTS generation failed: {e}", exc_info=True)
@@ -117,7 +181,7 @@ async def tts_generate(request: Request, tts_engine: TextToSpeechEngine = Depend
 @app.post("/voices", dependencies=[Depends(get_api_key)])
 async def upload_voice(
     file: UploadFile = File(...),
-    voice_manager: VoiceManager = Depends(),
+    voice_manager: VoiceManager = Depends(get_voice_manager),
     tts_engine: TextToSpeechEngine = Depends(get_tts_engine)
 ):
     """
@@ -135,7 +199,7 @@ async def upload_voice(
         return JSONResponse(content={"error": "Internal server error"}, status_code=500)
 
 @app.get("/voices", dependencies=[Depends(get_api_key)])
-async def list_voices(voice_manager: VoiceManager = Depends()):
+async def list_voices(voice_manager: VoiceManager = Depends(get_voice_manager)):
     """
     Get a list of all available voices.
     """
@@ -144,7 +208,7 @@ async def list_voices(voice_manager: VoiceManager = Depends()):
 @app.delete("/voices/{voice_id}", dependencies=[Depends(get_api_key)])
 async def delete_voice(
     voice_id: str,
-    voice_manager: VoiceManager = Depends(),
+    voice_manager: VoiceManager = Depends(get_voice_manager),
     tts_engine: TextToSpeechEngine = Depends(get_tts_engine)
 ):
     """
