@@ -355,8 +355,8 @@ class TextToSpeechEngine:
                         output_chunk = torch.cat((prev_main_body, mixed_region))
                         await audio_chunk_queue.put(self.audio_processor.to_pcm(output_chunk))
 
-                        # The new previous_audio_chunk is the remainder of the current chunk
-                        previous_audio_chunk = current_audio_chunk[fade_len:]
+                        # The new previous_audio_chunk is the entire current chunk, which will be processed in the next iteration
+                        previous_audio_chunk = current_audio_chunk
                     else:
                         # Not enough data to fade, just send the previous chunk as is
                         await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
