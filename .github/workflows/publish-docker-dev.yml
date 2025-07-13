@@ -1,9 +1,9 @@
-name: Production  Docker Build and Publish
+name: Development Docker Build and Publish
 
 on:
   push:
     branches:
-      - main
+      - dev
 
 jobs:
   docker:
@@ -32,7 +32,7 @@ jobs:
         with:
           push: true
           tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:dev
             ${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:${{ github.sha }}
-          cache-from: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:buildcache
-          cache-to: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:buildcache,mode=max
+          cache-from: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:buildcache-dev
+          cache-to: type=registry,ref=${{ vars.DOCKERHUB_USERNAME }}/chatterbox-tts:buildcache-dev,mode=max
