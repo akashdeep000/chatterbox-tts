@@ -288,13 +288,19 @@ class TextToSpeechEngine:
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
 
+                # Reset state for new text chunks
+                if text_chunk_num != last_text_chunk_num:
+                    accumulated_tokens = []
+                    previous_length = 0
+                    last_text_chunk_num = text_chunk_num
+
                 # 1. Prepare tokens for S3Gen based on overlap method
                 if params.chunk_overlap_method == "full":
-                    # This logic is now handled by the T3 producer, which sends full token streams
-                    # for each chunk. The consumer just needs to process them.
-                    pass
-
-                speech_tokens = token_chunk.unsqueeze(0)
+                    accumulated_tokens.extend(token_chunk.tolist())
+                    speech_tokens_np = np.array(accumulated_tokens)
+                    speech_tokens = torch.from_numpy(speech_tokens_np).unsqueeze(0)
+                else:  # zero overlap
+                    speech_tokens = token_chunk.unsqueeze(0)
                 eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
                 tokens_with_eos = torch.cat([speech_tokens.to(self.device), eos_token], dim=1)
                 speech_tokens = tokens_with_eos[0]
@@ -312,7 +318,14 @@ class TextToSpeechEngine:
                     wav, _ = await loop.run_in_executor(None, partial_inference)
                 current_audio_chunk = wav.squeeze(0).detach()
 
-                # 3. Post-processing (Trimming)
+                # 3. Post-processing based on overlap method
+                if params.chunk_overlap_method == "full":
+                    new_audio_length = current_audio_chunk.shape[0]
+                    if previous_length > 0:
+                        current_audio_chunk = current_audio_chunk[previous_length:]
+                    previous_length = new_audio_length
+
+                # These trims should apply to all methods for the respective slices
                 if params.remove_milliseconds > 0 and slice_num == total_slices:
                     trim_samples = int(self.sr * params.remove_milliseconds / 1000)
                     current_audio_chunk = current_audio_chunk[:-trim_samples]
