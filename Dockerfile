@@ -1,6 +1,6 @@
 # Stage 1: Production Environment
 # Use a single-stage build with the runtime image
-FROM nvidia/cuda:12.4.1-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
