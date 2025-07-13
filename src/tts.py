@@ -350,7 +350,10 @@ class TextToSpeechEngine:
                 if params.crossfade_duration > 0 and previous_audio_chunk is not None:
                     fade_len = int(self.sr * params.crossfade_duration)
                     if fade_len > 0 and previous_audio_chunk.shape[0] > fade_len and current_audio_chunk.shape[0] > fade_len:
-                        # Get the tail of the previous chunk and the head of the current chunk
+                        # The part of the previous chunk that doesn't overlap
+                        prev_main_body = previous_audio_chunk[:-fade_len]
+
+                        # The overlapping parts
                         prev_tail = previous_audio_chunk[-fade_len:]
                         current_head = current_audio_chunk[:fade_len]
 
@@ -362,7 +365,7 @@ class TextToSpeechEngine:
                         mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
 
                         # The output is the main body of the previous chunk, followed by the mixed region
-                        output_chunk = torch.cat((previous_audio_chunk[:-fade_len], mixed_region))
+                        output_chunk = torch.cat((prev_main_body, mixed_region))
                         await audio_chunk_queue.put(self.audio_processor.to_pcm(output_chunk))
 
                         # The new previous_audio_chunk is the remainder of the current chunk
