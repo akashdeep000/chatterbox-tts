@@ -236,12 +236,24 @@ class TextToSpeechEngine:
                 )
 
                 # 4. Slice the buffered tokens and queue them with metadata
-                slices = []
-                while len(token_stream) >= params.tokens_per_slice:
-                    slices.append(token_stream[:params.tokens_per_slice])
-                    token_stream = token_stream[params.tokens_per_slice:]
-                if token_stream:
-                    slices.append(token_stream)
+                if not token_stream:
+                    slices = []
+                else:
+                    # Create all slices at once
+                    slices = [
+                        token_stream[i : i + params.tokens_per_slice]
+                        for i in range(0, len(token_stream), params.tokens_per_slice)
+                    ]
+                    # Check if the last slice is very short and should be merged with the
+                    # previous one. This prevents creating tiny, problematic audio chunks.
+                    # The threshold is dynamic: 20% of the slice size, but at least 3.
+                    merge_threshold = max(3, int(params.tokens_per_slice * 0.2))
+                    if len(slices) > 1 and len(slices[-1]) < merge_threshold:
+                        log.info(
+                            f"Merging a very short final slice (length {len(slices[-1])}, "
+                            f"threshold is {merge_threshold}) with the previous one."
+                        )
+                        slices[-2].extend(slices.pop())
 
                 total_slices = len(slices)
                 # Define the trigger point for the consumer to signal back.
@@ -306,6 +318,13 @@ class TextToSpeechEngine:
                 speech_tokens = tokens_with_eos[0]
                 speech_tokens = drop_invalid_tokens(speech_tokens)
                 speech_tokens = speech_tokens[speech_tokens < 6561].to(self.device)
+
+                # If, after filtering, we have no valid tokens, skip this slice entirely.
+                if speech_tokens.shape[-1] == 0:
+                    log.warning("Skipping a slice because it contained no valid tokens after filtering.")
+                    speech_token_queue.task_done()
+                    continue
+
                 if speech_tokens.shape[-1] < 3:
                     padding_needed = 3 - speech_tokens.shape[-1]
                     speech_tokens = F.pad(speech_tokens, (0, padding_needed), "constant", 0)
@@ -334,38 +353,45 @@ class TextToSpeechEngine:
                     current_audio_chunk = current_audio_chunk[trim_samples_start:]
 
                 # 4. Cross-fading and Queueing
-                if params.crossfade_duration > 0 and previous_audio_chunk is not None:
+                output_chunk = None
+                if previous_audio_chunk is None:
+                    # This is the first chunk, buffer it and continue.
+                    previous_audio_chunk = current_audio_chunk
+                else:
+                    # We have a previous chunk, so we can process it.
                     fade_len = int(self.sr * params.crossfade_duration)
-                    if fade_len > 0 and previous_audio_chunk.shape[0] > fade_len and current_audio_chunk.shape[0] > fade_len:
+                    can_fade = (
+                        params.crossfade_duration > 0
+                        and fade_len > 0
+                        and previous_audio_chunk.shape[0] > fade_len
+                        and current_audio_chunk.shape[0] > fade_len
+                    )
+
+                    if can_fade:
+                        # --- Cross-fade logic ---
                         # The part of the previous chunk that doesn't overlap
                         prev_main_body = previous_audio_chunk[:-fade_len]
-
                         # The overlapping parts
                         prev_tail = previous_audio_chunk[-fade_len:]
                         current_head = current_audio_chunk[:fade_len]
-
                         # Create fade curves
                         fade_out = torch.linspace(1.0, 0.0, fade_len, device=self.device)
                         fade_in = torch.linspace(0.0, 1.0, fade_len, device=self.device)
-
                         # Apply fades and mix
                         mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
-
                         # The output is the main body of the previous chunk, followed by the mixed region
                         output_chunk = torch.cat((prev_main_body, mixed_region))
-                        await audio_chunk_queue.put(self.audio_processor.to_pcm(output_chunk))
-
-                        # The new previous_audio_chunk is the entire current chunk, which will be processed in the next iteration
-                        previous_audio_chunk = current_audio_chunk
+                        # The new buffer is the remainder of the current chunk
+                        previous_audio_chunk = current_audio_chunk[fade_len:]
                     else:
-                        # Not enough data to fade, just send the previous chunk as is
-                        await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
+                        # --- No fade logic ---
+                        # Output the entire previous chunk
+                        output_chunk = previous_audio_chunk
+                        # Buffer the entire current chunk
                         previous_audio_chunk = current_audio_chunk
-                else:
-                    # No cross-fading, or this is the first chunk. Buffer it.
-                    if previous_audio_chunk is not None:
-                        await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
-                    previous_audio_chunk = current_audio_chunk
+
+                if output_chunk is not None:
+                    await audio_chunk_queue.put(self.audio_processor.to_pcm(output_chunk))
 
                 log.info(
                     f"S3Gen: Finished inference for slice {slice_num}/{total_slices} "
