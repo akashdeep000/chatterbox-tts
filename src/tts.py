@@ -124,16 +124,12 @@ class TextToSpeechEngine:
         else:
             self.device = "cpu"
 
-        self.fp16 = tts_config.enable_fp16 and self.device == "cuda"
-        self.dtype = torch.float16 if self.fp16 else torch.float32
 
         # Load the core ChatterboxTTS model from a local path
         self.tts = OriginalChatterboxTTS.from_local(
             settings.MODEL_PATH,
             device=self.device
         )
-        if self.fp16:
-            self.tts = self.tts.half()
         # Initialize voice manager for handling different voices
         self.voice_manager = VoiceManager()
         # Store model conditionals, initially from the loaded model
@@ -168,8 +164,6 @@ class TextToSpeechEngine:
         ve_embed = torch.from_numpy(self.tts.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
-        if self.fp16:
-            ve_embed = ve_embed.half()
 
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
@@ -409,7 +403,7 @@ class TextToSpeechEngine:
             else:
                 raise ValueError("No audio prompt provided, and no default conditionals are loaded.")
 
-        current_exaggeration_tensor = exaggeration * torch.ones(1, 1, 1, device=self.device, dtype=self.dtype)
+        current_exaggeration_tensor = exaggeration * torch.ones(1, 1, 1, device=self.device)
         if not torch.equal(conds.t3.emotion_adv, current_exaggeration_tensor):
             _cond: T3Cond = conds.t3
             conds.t3 = T3Cond(

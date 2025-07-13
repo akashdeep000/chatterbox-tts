@@ -43,7 +43,6 @@ class TTSConfig(BaseModel):
     remove_milliseconds: int = 15
     remove_milliseconds_start: int = 10
     chunk_overlap_method: str = "zero"
-    enable_fp16: bool = True # Use half-precision for faster inference on compatible GPUs
 
 # Instantiate the config objects to be used across the application
 settings = AppConfig()
