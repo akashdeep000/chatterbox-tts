@@ -215,7 +215,7 @@ class TextToSpeechEngine:
                 log.info(f"T3: Processing text chunk {i+1}/{num_chunks}")
                 # 1. Text to Tokens
                 text_tokens = await loop.run_in_executor(
-                    None, self.tts.tokenizer.text_to_tokens, punc_norm(chunk)
+                    None, self.tts.tokenizer.text_to_tokens, chunk
                 )
                 if params.cfg_weight > 0.0:
                     text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
@@ -431,7 +431,8 @@ class TextToSpeechEngine:
 
         yield self.audio_processor.create_wav_header(self.sr)
 
-        text_chunks = split_text_into_chunks(text, text_chunk_size)
+        raw_chunks = split_text_into_chunks(text, text_chunk_size)
+        text_chunks = [punc_norm(chunk) for chunk in raw_chunks]
         if not text_chunks:
             return
 

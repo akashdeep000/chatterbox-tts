@@ -6,6 +6,43 @@ Chatterbox TTS is a high-performance, containerized Text-to-Speech (TTS) service
 
 This project provides a flexible and scalable solution for generating speech from text. It exposes a RESTful API for generating complete audio files and is built to be easily deployable and managed as a serverless endpoint.
 
+### High-Level Architecture
+
+The following diagram illustrates the high-level architecture of the Chatterbox TTS service:
+
+```mermaid
+graph TD
+    subgraph "Client"
+        A[User Application]
+    end
+
+    subgraph "Chatterbox TTS Service"
+        B[FastAPI Web Server]
+        C[TTS Engine]
+        D[Voice Manager]
+        E[Voice Cache]
+    end
+
+    subgraph "Infrastructure"
+        F[Docker Container]
+        G[GPU]
+        H[Persistent Volume]
+    end
+
+    A -- "HTTP Request /tts/generate" --> B
+    B -- "Calls" --> C
+    C -- "Uses" --> G
+    C -- "Requests Voice Conditionals" --> D
+    D -- "Loads/Saves Voices" --> H
+    D -- "Caches Conditionals" --> E
+    C -- "Uses Cached Conditionals" --> E
+    B -- "Streams Audio Response" --> A
+
+    style F fill:#f9f,stroke:#333,stroke-width:2px
+    style G fill:#ccf,stroke:#333,stroke-width:2px
+    style H fill:#cfc,stroke:#333,stroke-width:2px
+```
+
 ## Prerequisites
 
 To run this project, you will need:
@@ -137,17 +174,188 @@ curl -X GET "http://localhost:8000/tts/generate?text=Hello%20world&voice_id=your
 <audio controls src="http://localhost:8000/tts/generate?text=Hello%20world&api_key=<YOUR_API_KEY>"></audio>
 ```
 
+#### TTS Parameters
+
+The `/tts/generate` endpoint accepts several parameters to customize the audio generation. These can be provided in the query string for `GET` requests or in the JSON body for `POST` requests.
+
+| Parameter                   | Type    | Default Value      | Description                                                                                                                            |
+| --------------------------- | ------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `text`                      | string  | **(Required)**     | The text to be converted to speech.                                                                                                    |
+| `voice_id`                  | string  | `None`             | The ID of the custom voice to use (e.g., `your_voice.wav`). If not provided, a default voice is used.                                    |
+| `exaggeration`              | float   | `0.5`              | Controls the emotional expressiveness of the speech. Higher values produce more exaggerated speech.                                    |
+| `cfg_weight`                | float   | `0.5`              | Classifier-Free Guidance weight. Higher values make the speech more closely follow the text, but can reduce naturalness.               |
+| `temperature`               | float   | `0.8`              | Controls the randomness of the output. Higher values produce more varied and creative speech, while lower values are more deterministic. |
+| `text_chunk_size`           | integer | `100`              | The number of characters to process in each text chunk. Smaller values can reduce latency but may affect prosody.                      |
+| `tokens_per_slice`          | integer | `35`               | The number of audio tokens to generate in each slice. This affects the granularity of the streaming output.                            |
+| `remove_milliseconds`       | integer | `0`                | The number of milliseconds to trim from the end of the final audio chunk. Useful for removing trailing silence.                        |
+| `remove_milliseconds_start` | integer | `0`                | The number of milliseconds to trim from the beginning of the first audio chunk.                                                        |
+| `chunk_overlap_method`      | string  | `"full"`           | The method for handling overlapping audio chunks. Can be `"full"` or `"zero"`.                                                         |
+| `crossfade_duration`        | float   | `0.008` (internal) | The duration of the crossfade between audio chunks in seconds. This is an internal parameter and not directly exposed via the API.     |
+
 ### Performance Optimizations
 
 The TTS engine is optimized for real-time performance through several mechanisms:
-*   **Model Pre-compilation:** The underlying TTS model is pre-compiled when the service starts, reducing latency on all subsequent requests.
-*   **Voice Caching:** When a custom voice is used for the first time, its audio characteristics are processed and cached. Subsequent requests with the same voice will use the cached data, resulting in significantly faster audio generation.
-*   **Cache Invalidation:** The voice cache is automatically cleared when a voice is updated or deleted, ensuring that the most up-to-date voice data is always used.
 
+#### Parameter Tuning for Quality and Speed
+
+The `text_chunk_size`, `tokens_per_slice`, and `chunk_overlap_method` parameters are crucial for balancing audio quality and streaming latency. Understanding how they work together allows you to fine-tune the TTS engine for your specific needs.
+
+*   **`text_chunk_size`**: This parameter determines how the input text is split into smaller pieces. The T3 model processes one chunk at a time.
+    *   **Smaller values** (e.g., 50) lead to lower "time to first audio" because the first chunk is processed faster. However, this can sometimes result in less natural prosody, as the model has less context.
+    *   **Larger values** (e.g., 200) provide more context to the model, which can improve the naturalness of the speech, but it will take longer to receive the first audio chunk.
+
+*   **`tokens_per_slice`**: After the T3 model converts a text chunk into a sequence of speech tokens, this parameter determines how many of those tokens are sent to the S3Gen model at a time to be converted into audio.
+    *   **Smaller values** (e.g., 20) result in smaller, more frequent audio chunks being streamed to the client, which can create a smoother streaming experience.
+    *   **Larger values** (e.g., 50) will result in fewer, larger audio chunks, which can be more efficient but may feel less "real-time."
+
+*   **`chunk_overlap_method`**: This parameter defines how the audio from different text chunks is stitched together.
+    *   **`"full"`**: This method creates a seamless overlap between audio chunks, which generally produces the highest quality audio by avoiding clicks or pauses. It is slightly more computationally intensive.
+    *   **`"zero"`**: This method simply concatenates the audio chunks. It is faster but may occasionally produce audible artifacts at the seams between chunks.
+
+The following diagram illustrates how these parameters relate to each other in the TTS process:
+
+```mermaid
+graph TD
+    subgraph "Input Text"
+        A["The quick brown fox jumps over the lazy dog."]
+    end
+
+    subgraph "Text Chunking (text_chunk_size)"
+        B["The quick brown fox..."]
+        C["...jumps over the lazy dog."]
+    end
+
+    subgraph "T3 Model (Text-to-Tokens)"
+        D["[Speech Tokens for Chunk 1]"]
+        E["[Speech Tokens for Chunk 2]"]
+    end
+
+    subgraph "Token Slicing (tokens_per_slice)"
+        F["Slice 1.1"]
+        G["Slice 1.2"]
+        H["Slice 2.1"]
+        I["Slice 2.2"]
+    end
+
+    subgraph "S3Gen Model (Tokens-to-Audio)"
+        J["Audio for Slice 1.1"]
+        K["Audio for Slice 1.2"]
+        L["Audio for Slice 2.1"]
+        M["Audio for Slice 2.2"]
+    end
+
+    subgraph "Output Stream (chunk_overlap_method)"
+        N["Final Audio Stream"]
+    end
+
+    A -- "split by text_chunk_size" --> B & C
+    B --> D
+    C --> E
+    D -- "split by tokens_per_slice" --> F & G
+    E -- "split by tokens_per_slice" --> H & I
+    F --> J
+    G --> K
+    H --> L
+    I --> M
+    J & K & L & M -- "stitched by chunk_overlap_method" --> N
+
+```
+
+*   **Aggressive Pre-caching**: To eliminate warm-up latency, the service pre-loads all TTS models and pre-caches the conditioning data for *all available voices* into GPU memory at startup. This ensures that every voice is ready for immediate, high-performance inference from the very first request.
+*   **Intelligent Cache Invalidation**: The voice cache is automatically and precisely invalidated when a voice is updated or deleted, guaranteeing that the system always uses the most recent voice data without requiring a manual restart.
+*   **Asynchronous Streaming Pipeline**: The core of the real-time streaming is a highly efficient producer-consumer pattern. The T3 model (producer) generates speech tokens concurrently while the S3Gen model (consumer) converts them into audio. This decoupling prevents stalls and ensures a smooth, continuous flow of audio data.
+*   **Proactive Inference**: The pipeline uses a signaling mechanism that allows the T3 model to proactively start processing the *next* chunk of text while the S3Gen model is still working on the current one. This advanced optimization minimizes gaps in audio generation, leading to a significant reduction in perceived latency for longer texts.
+
+#### Real-Time TTS Generation Sequence
+
+The real-time audio streaming is achieved through a producer-consumer pattern, where the T3 model produces speech tokens and the S3Gen model consumes them to generate audio. This allows for a continuous stream of audio with low latency.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant FastAPI
+    participant T3_Producer as T3 Producer
+    participant S3Gen_Consumer as S3Gen Consumer
+    participant SpeechTokenQueue as Speech Token Queue
+    participant AudioChunkQueue as Audio Chunk Queue
+
+    Client->>FastAPI: POST /tts/generate (text)
+    FastAPI->>T3_Producer: Start Task (text_chunks)
+    loop For each text chunk
+        T3_Producer->>T3_Producer: Generate Speech Tokens
+        T3_Producer->>SpeechTokenQueue: Enqueue Speech Tokens
+    end
+    FastAPI->>S3Gen_Consumer: Start Task
+    loop Until stream ends
+        S3Gen_Consumer->>SpeechTokenQueue: Dequeue Speech Tokens
+        S3Gen_Consumer->>S3Gen_Consumer: Generate Audio Chunk
+        S3Gen_Consumer->>AudioChunkQueue: Enqueue Audio Chunk
+        AudioChunkQueue-->>FastAPI: Dequeue Audio Chunk
+        FastAPI-->>Client: Stream Audio Chunk
+    end
+```
 
 ### Voice Management API
 
 The service provides a set of RESTful endpoints to manage custom voices.
+
+#### Voice Caching and Management
+
+The voice management system is designed for efficiency and scalability. When a voice is uploaded, it is stored persistently. To ensure the lowest possible latency, the application automatically pre-caches all available voices into memory on startup. This means that all voices are ready for immediate use without any warm-up delay on the first request. The cache is also intelligently invalidated and updated whenever a voice is uploaded or deleted.
+
+```mermaid
+graph TD
+    subgraph "User Interaction"
+        A[Client]
+    end
+
+    subgraph "API Endpoints"
+        B[POST /voices]
+        C[GET /voices]
+        D[DELETE /voices/voice_id]
+    end
+
+    subgraph "System Components"
+        E[Voice Manager]
+        F[Voice Cache In-Memory]
+        G[Persistent Volume /app/voices]
+    end
+
+    A -- "Upload voice.wav" --> B
+    B -- "Saves file" --> E
+    E -- "Stores voice.wav" --> G
+    E -- "Invalidates Cache for voice.wav" --> F
+
+    A -- "List voices" --> C
+    C -- "Reads from" --> E
+    E -- "Lists files from" --> G
+
+    A -- "Delete voice.wav" --> D
+    D -- "Deletes file" --> E
+    E -- "Removes voice.wav" --> G
+    E -- "Invalidates Cache for voice.wav" --> F
+
+    subgraph "TTS Generation with Caching"
+        H[TTS Request with voice_id]
+        I[TTS Engine]
+    end
+
+    H --> I
+    I -- "Request Conditionals" --> E
+    E -- "Check Cache" --> F
+    alt "Cache Miss"
+        F -- "Not Found" --> E
+        E -- "Load from Disk" --> G
+        E -- "Prepare Conditionals" --> I
+        E -- "Store in Cache" --> F
+    else "Cache Hit"
+        F -- "Return Cached Conditionals" --> I
+    end
+    I -- "Generate Audio" --> H
+
+    style F fill:#ffc,stroke:#333,stroke-width:2px
+    style G fill:#cfc,stroke:#333,stroke-width:2px
+```
 
 #### Upload a Voice
 

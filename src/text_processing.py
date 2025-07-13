@@ -2,6 +2,8 @@
 Text processing utilities for TTS
 """
 from typing import List
+import pysbd
+import re
 
 def punc_norm(text: str) -> str:
     """
@@ -13,7 +15,7 @@ def punc_norm(text: str) -> str:
         text = text[0].upper() + text[1:]
     text = " ".join(text.split())
     punc_to_replace = [
-        ("...", ", "), ("…", ", "), (":", ","), (" - ", ", "), (";", ", "),
+        ("...", ". "), ("…", ". "), (" - ", ", "),
         ("—", "-"), ("–", "-"), (" ,", ","), ("“", "\""), ("”", "\""),
         ("‘", "'"), ("’", "'"),
     ]
@@ -26,100 +28,71 @@ def punc_norm(text: str) -> str:
     return text
 
 def split_text_into_chunks(text: str, max_length: int = None) -> list:
-    """Split text into manageable chunks for TTS processing"""
+    """Split text into manageable chunks for TTS processing using pysbd."""
+    if max_length is None or len(text) <= max_length:
+        return [text] if text.strip() else []
 
-    if len(text) <= max_length:
-        return [text]
+    seg = pysbd.Segmenter(language="en", clean=False)
+    sentences = seg.segment(text)
 
-    # Try to split at sentence boundaries first
-    sentence_endings = ['. ', '! ', '? ', '.\n', '!\n', '?\n']
     chunks = []
     current_chunk = ""
 
-    # Split into sentences
-    sentences = []
-    temp_text = text
-
-    while temp_text:
-        best_split = len(temp_text)
-        best_ending = ""
-
-        for ending in sentence_endings:
-            pos = temp_text.find(ending)
-            if pos != -1 and pos < best_split:
-                best_split = pos + len(ending)
-                best_ending = ending
-
-        if best_split == len(temp_text):
-            # No sentence ending found, take the rest
-            sentences.append(temp_text)
-            break
-        else:
-            sentences.append(temp_text[:best_split])
-            temp_text = temp_text[best_split:]
-
-    # Group sentences into chunks
     for sentence in sentences:
         sentence = sentence.strip()
         if not sentence:
             continue
 
-        if len(current_chunk) + len(sentence) <= max_length:
+        if len(current_chunk) + len(sentence) + 1 <= max_length:
             current_chunk += (" " if current_chunk else "") + sentence
         else:
             if current_chunk:
-                chunks.append(current_chunk.strip())
+                chunks.append(current_chunk)
 
-            # If single sentence is too long, split it further
             if len(sentence) > max_length:
-                # Split at commas, semicolons, etc.
-                sub_delimiters = [', ', '; ', ' - ', ' — ']
-                sub_chunks = [sentence]
+                # This sentence is too long. We need to split it more granularly.
+                # First, split by a comprehensive set of delimiters to get clauses or phrases.
+                # The regex splits the string by the delimiters, keeping the delimiters in the list.
+                delimiters = r'([,;:—–\-"\'“”‘’\(\)\[\]\{\}])'
+                parts = re.split(delimiters, sentence)
 
-                for delimiter in sub_delimiters:
-                    new_sub_chunks = []
-                    for chunk in sub_chunks:
-                        if len(chunk) <= max_length:
-                            new_sub_chunks.append(chunk)
-                        else:
-                            parts = chunk.split(delimiter)
-                            current_part = ""
-                            for part in parts:
-                                if len(current_part) + len(delimiter) + len(part) <= max_length:
-                                    current_part += (delimiter if current_part else "") + part
-                                else:
-                                    if current_part:
-                                        new_sub_chunks.append(current_part)
-                                    current_part = part
-                            if current_part:
-                                new_sub_chunks.append(current_part)
-                    sub_chunks = new_sub_chunks
+                # Reconstruct phrases by joining each text part with its following delimiter.
+                phrases = []
+                current_phrase = ""
+                for part in parts:
+                    if not part:
+                        continue
+                    current_phrase += part
+                    # If the part is a delimiter, we consider the phrase complete.
+                    if re.fullmatch(delimiters, part):
+                        phrases.append(current_phrase.strip())
+                        current_phrase = ""
+                if current_phrase.strip():
+                    phrases.append(current_phrase.strip())
 
-                # Add sub-chunks
-                for sub_chunk in sub_chunks:
-                    if len(sub_chunk) <= max_length:
-                        chunks.append(sub_chunk.strip())
+                # Now, process each smaller phrase.
+                for phrase in phrases:
+                    if len(phrase) <= max_length:
+                        # This phrase is short enough, add it as a chunk.
+                        chunks.append(phrase)
                     else:
-                        # Last resort: split by words
-                        words = sub_chunk.split()
-                        current_word_chunk = ""
+                        # This phrase is STILL too long. As a last resort, split by words.
+                        words = phrase.split()
+                        word_chunk = ""
                         for word in words:
-                            if len(current_word_chunk) + len(word) + 1 <= max_length:
-                                current_word_chunk += (" " if current_word_chunk else "") + word
+                            if len(word_chunk) + len(word) + 1 <= max_length:
+                                word_chunk += (" " if word_chunk else "") + word
                             else:
-                                if current_word_chunk:
-                                    chunks.append(current_word_chunk)
-                                current_word_chunk = word
-                        if current_word_chunk:
-                            chunks.append(current_word_chunk)
+                                if word_chunk:
+                                    chunks.append(word_chunk)
+                                word_chunk = word
+                        if word_chunk:
+                            chunks.append(word_chunk)
                 current_chunk = ""
             else:
                 current_chunk = sentence
 
     if current_chunk:
-        chunks.append(current_chunk.strip())
+        chunks.append(current_chunk)
 
-    # Filter out empty chunks
-    chunks = [chunk for chunk in chunks if chunk.strip()]
-
-    return chunks
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
