@@ -303,60 +303,6 @@ The service provides a set of RESTful endpoints to manage custom voices.
 
 The voice management system is designed for efficiency and scalability. When a voice is uploaded, it is stored persistently. To ensure the lowest possible latency, the application automatically pre-caches all available voices into memory on startup. This means that all voices are ready for immediate use without any warm-up delay on the first request. The cache is also intelligently invalidated and updated whenever a voice is uploaded or deleted.
 
-```mermaid
-graph TD
-    subgraph "User Interaction"
-        A[Client]
-    end
-
-    subgraph "API Endpoints"
-        B[POST /voices]
-        C[GET /voices]
-        D[DELETE /voices/voice_id]
-    end
-
-    subgraph "System Components"
-        E[Voice Manager]
-        F[Voice Cache In-Memory]
-        G[Persistent Volume /app/voices]
-    end
-
-    A -- "Upload voice.wav" --> B
-    B -- "Saves file" --> E
-    E -- "Stores voice.wav" --> G
-    E -- "Invalidates Cache for voice.wav" --> F
-
-    A -- "List voices" --> C
-    C -- "Reads from" --> E
-    E -- "Lists files from" --> G
-
-    A -- "Delete voice.wav" --> D
-    D -- "Deletes file" --> E
-    E -- "Removes voice.wav" --> G
-    E -- "Invalidates Cache for voice.wav" --> F
-
-    subgraph "TTS Generation with Caching"
-        H[TTS Request with voice_id]
-        I[TTS Engine]
-    end
-
-    H --> I
-    I -- "Request Conditionals" --> E
-    E -- "Check Cache" --> F
-    alt "Cache Miss"
-        F -- "Not Found" --> E
-        E -- "Load from Disk" --> G
-        E -- "Prepare Conditionals" --> I
-        E -- "Store in Cache" --> F
-    else "Cache Hit"
-        F -- "Return Cached Conditionals" --> I
-    end
-    I -- "Generate Audio" --> H
-
-    style F fill:#ffc,stroke:#333,stroke-width:2px
-    style G fill:#cfc,stroke:#333,stroke-width:2px
-```
-
 #### Upload a Voice
 
 *   **Endpoint:** `POST /voices`
