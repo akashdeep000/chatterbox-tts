@@ -174,6 +174,20 @@ class TextToSpeechEngine:
         voice_id = Path(wav_fpath).name
         self.voice_cache[voice_id] = Conditionals(t3_cond, s3gen_ref_dict)
 
+    def _blocking_t3_inference(self, t3_cond, text_tokens, temperature, cfg_weight):
+        """Runs the blocking T3 inference and returns the full token stream."""
+        t3_inference_gen = self.tts.t3.inference(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            max_new_tokens=500,
+            temperature=temperature,
+            cfg_weight=cfg_weight,
+        )
+        token_stream = []
+        for speech_token_batch in t3_inference_gen:
+            token_stream.extend(speech_token_batch.squeeze(0))
+        return token_stream
+
     async def _t3_producer_task(
         self,
         text_chunks: list,
@@ -202,18 +216,15 @@ class TextToSpeechEngine:
 
                 # 2. T3 Inference (blocking)
                 log.info(f"T3: Starting inference for chunk {i+1}/{num_chunks}")
-                t3_inference_gen = self.tts.t3.inference(
-                    t3_cond=params.conds.t3,
-                    text_tokens=text_tokens,
-                    max_new_tokens=500,
-                    temperature=params.temperature,
-                    cfg_weight=params.cfg_weight,
+                # 3. T3 Inference (non-blocking)
+                token_stream = await loop.run_in_executor(
+                    None,
+                    self._blocking_t3_inference,
+                    params.conds.t3,
+                    text_tokens,
+                    params.temperature,
+                    params.cfg_weight,
                 )
-
-                # 3. Buffer all tokens from the generator for the current chunk
-                token_stream = []
-                for speech_token_batch in t3_inference_gen:
-                    token_stream.extend(speech_token_batch.squeeze(0))
 
                 # 4. Slice the buffered tokens and queue them with metadata
                 slices = []
@@ -226,7 +237,7 @@ class TextToSpeechEngine:
                 total_slices = len(slices)
                 # Define the trigger point for the consumer to signal back.
                 # It's the lower of 50% or the second-to-last slice, but at least 1.
-                trigger_point = min(total_slices // 2, max(1, total_slices - 1))
+                trigger_point = max(1, min(total_slices // 2, total_slices - 1))
 
                 log.info(f"T3: Finished inference for chunk {i+1}/{num_chunks}, created {total_slices} slices. Trigger point is slice {trigger_point}.")
 
