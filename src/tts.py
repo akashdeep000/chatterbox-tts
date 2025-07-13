@@ -63,7 +63,7 @@ class SynthesisParams:
     tokens_per_slice: int
     remove_milliseconds: int
     remove_milliseconds_start: int
-    chunk_overlap_method: Literal["zero", "full", "sliding"]
+    chunk_overlap_method: Literal["zero", "full"]
     crossfade_duration: float
     loop: asyncio.AbstractEventLoop
     text_chunk_count: int
@@ -271,8 +271,6 @@ class TextToSpeechEngine:
         previous_length = 0
         accumulated_tokens = []
         last_text_chunk_num = -1
-        previous_token_chunk = None
-        previous_wav_length = 0
         previous_audio_chunk = None
 
         try:
@@ -290,25 +288,13 @@ class TextToSpeechEngine:
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
 
-                # Reset state for new text chunks
-                if text_chunk_num != last_text_chunk_num:
-                    accumulated_tokens, previous_token_chunk, previous_audio_chunk = [], None, None
-                    previous_length, previous_wav_length = 0, 0
-                    last_text_chunk_num = text_chunk_num
-
                 # 1. Prepare tokens for S3Gen based on overlap method
                 if params.chunk_overlap_method == "full":
-                    accumulated_tokens.extend(token_chunk.tolist())
-                    speech_tokens_np = np.array(accumulated_tokens)
-                    speech_tokens = torch.from_numpy(speech_tokens_np).unsqueeze(0)
-                elif params.chunk_overlap_method == "sliding":
-                    if previous_token_chunk is not None:
-                        speech_tokens = torch.cat([previous_token_chunk, token_chunk], dim=0).unsqueeze(0)
-                    else:
-                        speech_tokens = token_chunk.unsqueeze(0)
-                else:  # zero overlap
-                    speech_tokens = token_chunk.unsqueeze(0)
+                    # This logic is now handled by the T3 producer, which sends full token streams
+                    # for each chunk. The consumer just needs to process them.
+                    pass
 
+                speech_tokens = token_chunk.unsqueeze(0)
                 eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
                 tokens_with_eos = torch.cat([speech_tokens.to(self.device), eos_token], dim=1)
                 speech_tokens = tokens_with_eos[0]
@@ -326,19 +312,7 @@ class TextToSpeechEngine:
                     wav, _ = await loop.run_in_executor(None, partial_inference)
                 current_audio_chunk = wav.squeeze(0).detach()
 
-                # 3. Post-processing based on overlap method
-                if params.chunk_overlap_method == "full":
-                    new_audio_length = current_audio_chunk.shape[0]
-                    if previous_length > 0:
-                        current_audio_chunk = current_audio_chunk[previous_length:]
-                    previous_length = new_audio_length
-                elif params.chunk_overlap_method == "sliding":
-                    if previous_wav_length > 0:
-                        current_audio_chunk = current_audio_chunk[previous_wav_length:]
-                    previous_wav_length = current_audio_chunk.shape[0]
-                    previous_token_chunk = token_chunk
-
-                # These trims should apply to all methods for the respective slices
+                # 3. Post-processing (Trimming)
                 if params.remove_milliseconds > 0 and slice_num == total_slices:
                     trim_samples = int(self.sr * params.remove_milliseconds / 1000)
                     current_audio_chunk = current_audio_chunk[:-trim_samples]
@@ -407,7 +381,7 @@ class TextToSpeechEngine:
         tokens_per_slice: Optional[int] = tts_config.tokens_per_slice,
         remove_milliseconds: int = tts_config.remove_milliseconds,
         remove_milliseconds_start: int = tts_config.remove_milliseconds_start,
-        chunk_overlap_method: Literal["zero", "full", "sliding"] = tts_config.chunk_overlap_method,
+        chunk_overlap_method: Literal["zero", "full"] = tts_config.chunk_overlap_method,
         crossfade_duration: float = tts_config.crossfade_duration,
         start_time: Optional[float] = None,
     ) -> AsyncGenerator[bytes, None]:

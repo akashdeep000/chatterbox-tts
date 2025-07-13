@@ -42,7 +42,7 @@ class TTSConfig(BaseModel):
     tokens_per_slice: int = 35
     remove_milliseconds: int = 0
     remove_milliseconds_start: int = 0
-    chunk_overlap_method: str = "full" # zero, full, sliding
+    chunk_overlap_method: str = "full" # or "zero"
     crossfade_duration: float = 0.008 # in seconds
 
 # Instantiate the config objects to be used across the application
