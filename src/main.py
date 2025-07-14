@@ -126,14 +126,15 @@ async def get_api_key(
 class TTSRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
-    exaggeration: float = tts_config.exaggeration
-    cfg_weight: float = tts_config.cfg_weight
-    temperature: float = tts_config.temperature
-    text_chunk_size: Optional[int] = tts_config.text_chunk_size
-    tokens_per_slice: Optional[int] = tts_config.tokens_per_slice
-    remove_milliseconds: int = tts_config.remove_milliseconds
-    remove_milliseconds_start: int = tts_config.remove_milliseconds_start
-    chunk_overlap_method: str = tts_config.chunk_overlap_method
+    voice_exaggeration_factor: float = tts_config.VOICE_EXAGGERATION_FACTOR
+    cfg_guidance_weight: float = tts_config.CFG_GUIDANCE_WEIGHT
+    synthesis_temperature: float = tts_config.SYNTHESIS_TEMPERATURE
+    text_processing_chunk_size: Optional[int] = tts_config.TEXT_PROCESSING_CHUNK_SIZE
+    audio_tokens_per_slice: Optional[int] = tts_config.AUDIO_TOKENS_PER_SLICE
+    remove_trailing_milliseconds: int = tts_config.REMOVE_TRAILING_MILLISECONDS
+    remove_leading_milliseconds: int = tts_config.REMOVE_LEADING_MILLISECONDS
+    chunk_overlap_strategy: str = tts_config.CHUNK_OVERLAP_STRATEGY
+    crossfade_duration_milliseconds: int = tts_config.CROSSFADE_DURATION_MILLISECONDS
 
 @app.api_route("/tts/generate", methods=["GET", "POST"], dependencies=[Depends(get_api_key)])
 async def tts_generate(
@@ -155,14 +156,15 @@ async def tts_generate(
         tts_request = TTSRequest(
             text=query_params.get("text"),
             voice_id=query_params.get("voice_id"),
-            exaggeration=float(query_params.get("exaggeration", tts_config.exaggeration)),
-            cfg_weight=float(query_params.get("cfg_weight", tts_config.cfg_weight)),
-            temperature=float(query_params.get("temperature", tts_config.temperature)),
-            text_chunk_size=int(query_params.get("text_chunk_size", tts_config.text_chunk_size)),
-            tokens_per_slice=int(query_params.get("tokens_per_slice", tts_config.tokens_per_slice)),
-            remove_milliseconds=int(query_params.get("remove_milliseconds", tts_config.remove_milliseconds)),
-            remove_milliseconds_start=int(query_params.get("remove_milliseconds_start", tts_config.remove_milliseconds_start)),
-            chunk_overlap_method=query_params.get("chunk_overlap_method", tts_config.chunk_overlap_method),
+            voice_exaggeration_factor=float(query_params.get("voice_exaggeration_factor", tts_config.VOICE_EXAGGERATION_FACTOR)),
+            cfg_guidance_weight=float(query_params.get("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT)),
+            synthesis_temperature=float(query_params.get("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE)),
+            text_processing_chunk_size=int(query_params.get("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE)),
+            audio_tokens_per_slice=int(query_params.get("audio_tokens_per_slice", tts_config.AUDIO_TOKENS_PER_SLICE)),
+            remove_trailing_milliseconds=int(query_params.get("remove_trailing_milliseconds", tts_config.REMOVE_TRAILING_MILLISECONDS)),
+            remove_leading_milliseconds=int(query_params.get("remove_leading_milliseconds", tts_config.REMOVE_LEADING_MILLISECONDS)),
+            chunk_overlap_strategy=query_params.get("chunk_overlap_strategy", tts_config.CHUNK_OVERLAP_STRATEGY),
+            crossfade_duration_milliseconds=int(query_params.get("crossfade_duration_milliseconds", tts_config.CROSSFADE_DURATION_MILLISECONDS)),
         )
 
     if not tts_request.text:
@@ -174,14 +176,15 @@ async def tts_generate(
         audio_stream = tts_engine.stream(
             text=tts_request.text,
             voice_id=tts_request.voice_id,
-            exaggeration=tts_request.exaggeration,
-            cfg_weight=tts_request.cfg_weight,
-            temperature=tts_request.temperature,
-            text_chunk_size=tts_request.text_chunk_size,
-            tokens_per_slice=tts_request.tokens_per_slice,
-            remove_milliseconds=tts_request.remove_milliseconds,
-            remove_milliseconds_start=tts_request.remove_milliseconds_start,
-            chunk_overlap_method=tts_request.chunk_overlap_method,
+            voice_exaggeration_factor=tts_request.voice_exaggeration_factor,
+            cfg_guidance_weight=tts_request.cfg_guidance_weight,
+            synthesis_temperature=tts_request.synthesis_temperature,
+            text_processing_chunk_size=tts_request.text_processing_chunk_size,
+            audio_tokens_per_slice=tts_request.audio_tokens_per_slice,
+            remove_trailing_milliseconds=tts_request.remove_trailing_milliseconds,
+            remove_leading_milliseconds=tts_request.remove_leading_milliseconds,
+            chunk_overlap_strategy=tts_request.chunk_overlap_strategy,
+            crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
             start_time=start_time
         )
         return StreamingResponse(audio_stream, media_type="audio/wav")
