@@ -38,8 +38,8 @@ class TTSConfig(BaseModel):
     exaggeration: float = 0.5
     cfg_weight: float = 0.5
     temperature: float = 0.8
-    text_chunk_size: int = 75
-    tokens_per_slice: int = 25
+    text_chunk_size: int = 100
+    tokens_per_slice: int = 35
     remove_milliseconds: int = 0
     remove_milliseconds_start: int = 0
     chunk_overlap_method: str = "full" # or "zero"

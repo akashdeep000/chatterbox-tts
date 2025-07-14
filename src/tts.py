@@ -86,10 +86,10 @@ class _AudioProcessor:
     @staticmethod
     def create_wav_header(sample_rate: int, channels: int = 1, sample_width: int = 2) -> bytes:
         """Creates a WAV file header for streaming."""
-        data_size = 2**31 - 1 - 44  # Max size for a 32-bit signed integer
+        data_size = 0xFFFFFFFF  # Set to 0xFFFFFFFF for streaming to indicate unknown size
         header = io.BytesIO()
         header.write(b'RIFF')
-        header.write((data_size + 36).to_bytes(4, 'little'))
+        header.write((data_size).to_bytes(4, 'little')) # Set to data_size (0xFFFFFFFF) for streaming
         header.write(b'WAVEfmt ')
         header.write((16).to_bytes(4, 'little'))
         header.write((1).to_bytes(2, 'little'))
@@ -333,7 +333,7 @@ class TextToSpeechEngine:
 
                     if current_slice:
                         # Handle the last, potentially short, slice.
-                        merge_threshold = max(10, int(params.tokens_per_slice * 0.2))
+                        merge_threshold = max(10, int(params.tokens_per_slice * 0.5))
                         if slices and len(current_slice) < merge_threshold:
                             log.info(
                                 f"Merging a very short final slice (length {len(current_slice)}, "
@@ -345,8 +345,8 @@ class TextToSpeechEngine:
 
                 total_slices = len(slices)
                 # Define the trigger point for the consumer to signal back.
-                # It's the lower of 75% or the second-to-last slice, but at least 1.
-                trigger_point = max(1, min(total_slices - 1, int(total_slices * 0.75)))
+                # It's the lower of 50% or the second-to-last slice, but at least 1.
+                trigger_point = max(1, min(total_slices - 1, int(total_slices * 0.50)))
 
                 log.info(f"T3: Finished inference for chunk {i+1}/{num_chunks}, created {total_slices} slices. Trigger point is slice {trigger_point}.")
 
@@ -543,7 +543,7 @@ class TextToSpeechEngine:
 
         # This queue buffers the final audio chunks before they are yielded to the client.
         # It helps to smooth out the delivery by handling any minor timing variations.
-        audio_chunk_queue = asyncio.Queue(maxsize=2)
+        audio_chunk_queue = asyncio.Queue(maxsize=5) # Increased buffer size for initial playback
 
         # This event synchronizes the producer and consumer, allowing the producer to start the
         # next chunk's T3 inference proactively when the consumer is partway through the current one.
