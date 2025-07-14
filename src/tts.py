@@ -239,26 +239,31 @@ class TextToSpeechEngine:
                 if not token_stream:
                     slices = []
                 else:
-                    # Create all slices at once
-                    slices = [
-                        token_stream[i : i + params.tokens_per_slice]
-                        for i in range(0, len(token_stream), params.tokens_per_slice)
-                    ]
-                    # Check if the last slice is very short and should be merged with the
-                    # previous one. This prevents creating tiny, problematic audio chunks.
-                    # The threshold is dynamic: 20% of the slice size, but at least 3.
-                    merge_threshold = max(3, int(params.tokens_per_slice * 0.2))
-                    if len(slices) > 1 and len(slices[-1]) < merge_threshold:
-                        log.info(
-                            f"Merging a very short final slice (length {len(slices[-1])}, "
-                            f"threshold is {merge_threshold}) with the previous one."
-                        )
-                        slices[-2].extend(slices.pop())
+                    # Explicitly create slices to ensure clarity and handle short final slices.
+                    slices = []
+                    current_slice = []
+                    for token in token_stream:
+                        current_slice.append(token)
+                        if len(current_slice) >= params.tokens_per_slice:
+                            slices.append(current_slice)
+                            current_slice = []
+
+                    if current_slice:
+                        # # Handle the last, potentially short, slice.
+                        # merge_threshold = max(3, int(params.tokens_per_slice * 0.2))
+                        # if slices and len(current_slice) < merge_threshold:
+                        #     log.info(
+                        #         f"Merging a very short final slice (length {len(current_slice)}, "
+                        #         f"threshold is {merge_threshold}) with the previous one."
+                        #     )
+                        #     slices[-1].extend(current_slice)
+                        # else:
+                            slices.append(current_slice)
 
                 total_slices = len(slices)
                 # Define the trigger point for the consumer to signal back.
-                # It's the lower of 50% or the second-to-last slice, but at least 1.
-                trigger_point = max(1, min(total_slices // 2, total_slices - 1))
+                # It's the lower of 75% or the second-to-last slice, but at least 1.
+                trigger_point = max(1, min(total_slices - 1, int(total_slices * 0.75)))
 
                 log.info(f"T3: Finished inference for chunk {i+1}/{num_chunks}, created {total_slices} slices. Trigger point is slice {trigger_point}.")
 
