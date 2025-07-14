@@ -15,6 +15,16 @@ import gc
 import asyncio
 import time
 import functools
+from enum import Enum
+
+
+class InitializationState(Enum):
+    """Represents the initialization state of the TTS engine."""
+    NOT_STARTED = "not_started"
+    INITIALIZING = "initializing"
+    READY = "ready"
+    ERROR = "error"
+
 
 # Third-party imports
 import librosa
@@ -114,37 +124,107 @@ class TextToSpeechEngine:
 
     def __init__(self):
         """
-        Initializes the TTS engine, loads models, and sets the computation device.
-        It automatically detects and uses CUDA or MPS if available, otherwise falls back to CPU.
+        Initializes the TTS engine, setting up basic attributes.
+        Model loading and device setup are handled asynchronously by `ainit`.
         """
-        # Auto-detect best available device
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-
+        self.device = None # Will be set during async initialization
         self.t3_stream = None
         self.s3gen_stream = None
-        if self.device == "cuda":
-            self.t3_stream = torch.cuda.Stream()
-            self.s3gen_stream = torch.cuda.Stream()
-
-        # Load the core ChatterboxTTS model from a local path
-        self.tts = OriginalChatterboxTTS.from_local(
-            settings.MODEL_PATH,
-            device=self.device
-        )
-        # Initialize voice manager for handling different voices
+        self.tts = None # Will be loaded during async initialization
         self.voice_manager = VoiceManager()
-        # Store model conditionals, initially from the loaded model
         self.voice_cache: dict[str, Conditionals] = {}
-        # Cache for the path of the audio prompt to avoid reprocessing
         self._cached_audio_prompt_path: Optional[str] = None
-        # Set the sample rate from the model configuration
-        self.sr = self.tts.sr
+        self.sr = S3GEN_SR # Default, will be updated after model loads
         self.audio_processor = _AudioProcessor()
+        self._initialization_state: InitializationState = InitializationState.NOT_STARTED
+        self._initialization_progress: str = ""
+        self._initialization_error: Optional[str] = None
+
+    async def ainit(self):
+        """
+        Asynchronously initializes the TTS engine, loads models, and sets the computation device.
+        It automatically detects and uses CUDA or MPS if available, otherwise falls back to CPU.
+        """
+        try:
+            self._initialization_state = InitializationState.INITIALIZING
+            self._initialization_progress = "Validating configuration..."
+
+            # Auto-detect best available device
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+
+
+            log.info(f"Initializing Chatterbox TTS model...")
+            log.info(f"Device: {self.device}")
+            log.info(f"Model path: {settings.MODEL_PATH}")
+
+            self.t3_stream = None
+            self.s3gen_stream = None
+            if self.device == "cuda":
+                self.t3_stream = torch.cuda.Stream()
+                self.s3gen_stream = torch.cuda.Stream()
+
+            self._initialization_progress = "Configuring device compatibility..."
+            # Patch torch.load for CPU compatibility if needed
+            if self.device == 'cpu':
+                original_load = torch.load
+                original_load_file = None
+
+                # Try to patch safetensors if available
+                try:
+                    import safetensors.torch
+                    original_load_file = safetensors.torch.load_file
+                except ImportError:
+                    pass
+
+                def force_cpu_torch_load(f, map_location=None, **kwargs):
+                    # Always force CPU mapping if we're on a CPU device
+                    return original_load(f, map_location='cpu', **kwargs)
+
+                def force_cpu_load_file(filename, device=None):
+                    # Force CPU for safetensors loading too
+                    return original_load_file(filename, device='cpu')
+
+                torch.load = force_cpu_torch_load
+                if original_load_file:
+                    safetensors.torch.load_file = force_cpu_load_file
+
+            self._initialization_progress = "Loading TTS model (this may take a while)..."
+            # Initialize model with run_in_executor for non-blocking
+            loop = asyncio.get_event_loop()
+            self.tts = await loop.run_in_executor(
+                None,
+                lambda: OriginalChatterboxTTS.from_local(
+                    settings.MODEL_PATH,
+                    device=self.device
+                )
+            )
+            self.sr = self.tts.sr # Set sample rate from the loaded model
+
+            self._initialization_state = InitializationState.READY
+            self._initialization_progress = "Model ready"
+            self._initialization_error = None
+            log.info(f"✓ Model initialized successfully on {self.device}")
+            return self.tts
+
+        except Exception as e:
+            self._initialization_state = InitializationState.ERROR
+            self._initialization_error = str(e)
+            self._initialization_progress = f"Failed: {str(e)}"
+            log.error(f"✗ Failed to initialize model: {e}")
+            raise e
+
+    def get_initialization_status(self) -> dict:
+        """Returns the current initialization status of the TTS engine."""
+        return {
+            "state": self._initialization_state.value,
+            "progress": self._initialization_progress,
+            "error": self._initialization_error
+        }
 
     def clear_voice_cache(self, voice_id: Optional[str] = None):
         """Clears the voice cache."""
@@ -217,6 +297,9 @@ class TextToSpeechEngine:
                 text_tokens = await loop.run_in_executor(
                     None, self.tts.tokenizer.text_to_tokens, chunk
                 )
+                # Move text_tokens to the correct device
+                text_tokens = text_tokens.to(self.device)
+
                 if params.cfg_weight > 0.0:
                     text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
                 sot, eot = self.tts.t3.hp.start_text_token, self.tts.t3.hp.stop_text_token
@@ -249,15 +332,15 @@ class TextToSpeechEngine:
                             current_slice = []
 
                     if current_slice:
-                        # # Handle the last, potentially short, slice.
-                        # merge_threshold = max(3, int(params.tokens_per_slice * 0.2))
-                        # if slices and len(current_slice) < merge_threshold:
-                        #     log.info(
-                        #         f"Merging a very short final slice (length {len(current_slice)}, "
-                        #         f"threshold is {merge_threshold}) with the previous one."
-                        #     )
-                        #     slices[-1].extend(current_slice)
-                        # else:
+                        # Handle the last, potentially short, slice.
+                        merge_threshold = max(10, int(params.tokens_per_slice * 0.2))
+                        if slices and len(current_slice) < merge_threshold:
+                            log.info(
+                                f"Merging a very short final slice (length {len(current_slice)}, "
+                                f"threshold is {merge_threshold}) with the previous one."
+                            )
+                            slices[-1].extend(current_slice)
+                        else:
                             slices.append(current_slice)
 
                 total_slices = len(slices)
@@ -286,17 +369,18 @@ class TextToSpeechEngine:
         """Consumer task for S3Gen model. Converts speech tokens to audio chunks."""
         loop = params.loop
         previous_length = 0
-        accumulated_tokens = []
+        accumulated_tokens = None # Initialize as None for tensor accumulation
         last_text_chunk_num = -1
         previous_audio_chunk = None
+        # Move eos_token creation outside the loop
+        eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
 
         try:
             while True:
                 queue_item = await speech_token_queue.get()
                 if queue_item is None:
-                    # End of stream, send any remaining buffered audio
-                    if previous_audio_chunk is not None:
-                        await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
+                    # End of stream. No more audio to process.
+                    # The last chunk should have already been sent by the main loop.
                     break
 
                 token_chunk, text_chunk_num, slice_num, total_slices, trigger_point = queue_item
@@ -307,22 +391,25 @@ class TextToSpeechEngine:
 
                 # Reset state for new text chunks
                 if text_chunk_num != last_text_chunk_num:
-                    accumulated_tokens = []
+                    accumulated_tokens = None # Reset to None for new text chunk
                     previous_length = 0
                     last_text_chunk_num = text_chunk_num
 
                 # 1. Prepare tokens for S3Gen based on overlap method
                 if params.chunk_overlap_method == "full":
-                    accumulated_tokens.extend(token_chunk.tolist())
-                    speech_tokens_np = np.array(accumulated_tokens)
-                    speech_tokens = torch.from_numpy(speech_tokens_np).unsqueeze(0)
+                    if accumulated_tokens is None:
+                        accumulated_tokens = token_chunk
+                    else:
+                        accumulated_tokens = torch.cat((accumulated_tokens, token_chunk), dim=0)
+                    speech_tokens = accumulated_tokens.unsqueeze(0)
                 else:  # zero overlap
                     speech_tokens = token_chunk.unsqueeze(0)
-                eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
-                tokens_with_eos = torch.cat([speech_tokens.to(self.device), eos_token], dim=1)
+                # eos_token is already moved outside the loop
+                tokens_with_eos = torch.cat([speech_tokens, eos_token], dim=1)
                 speech_tokens = tokens_with_eos[0]
                 speech_tokens = drop_invalid_tokens(speech_tokens)
-                speech_tokens = speech_tokens[speech_tokens < 6561].to(self.device)
+                # Remove redundant .to(self.device) as speech_tokens should already be on device
+                speech_tokens = speech_tokens[speech_tokens < 6561]
 
                 # If, after filtering, we have no valid tokens, skip this slice entirely.
                 if speech_tokens.shape[-1] == 0:
@@ -358,45 +445,50 @@ class TextToSpeechEngine:
                     current_audio_chunk = current_audio_chunk[trim_samples_start:]
 
                 # 4. Cross-fading and Queueing
-                output_chunk = None
+                output_to_send = None
                 if previous_audio_chunk is None:
-                    # This is the first chunk, buffer it and continue.
+                    # This is the very first chunk. Send it immediately.
+                    output_to_send = current_audio_chunk
+                    # For the next iteration, this current_audio_chunk becomes the 'previous' one.
                     previous_audio_chunk = current_audio_chunk
                 else:
-                    # We have a previous chunk, so we can process it.
+                    # For subsequent chunks, apply cross-fading or simply concatenate.
                     fade_len = int(self.sr * params.crossfade_duration)
                     can_fade = (
                         params.crossfade_duration > 0
                         and fade_len > 0
-                        and previous_audio_chunk.shape[0] > fade_len
-                        and current_audio_chunk.shape[0] > fade_len
+                        and previous_audio_chunk.shape[0] >= fade_len
+                        and current_audio_chunk.shape[0] >= fade_len
                     )
 
                     if can_fade:
                         # --- Cross-fade logic ---
-                        # The part of the previous chunk that doesn't overlap
+                        # The part of the previous chunk that will be sent before the fade
                         prev_main_body = previous_audio_chunk[:-fade_len]
-                        # The overlapping parts
+                        # The tail of the previous chunk that will be faded out
                         prev_tail = previous_audio_chunk[-fade_len:]
+                        # The head of the current chunk that will be faded in
                         current_head = current_audio_chunk[:fade_len]
-                        # Create fade curves
+                        # The main body of the current chunk that comes after the fade
+                        current_main_body = current_audio_chunk[fade_len:]
+
                         fade_out = torch.linspace(1.0, 0.0, fade_len, device=self.device)
                         fade_in = torch.linspace(0.0, 1.0, fade_len, device=self.device)
-                        # Apply fades and mix
                         mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
-                        # The output is the main body of the previous chunk, followed by the mixed region
-                        output_chunk = torch.cat((prev_main_body, mixed_region))
-                        # The new buffer is the remainder of the current chunk
-                        previous_audio_chunk = current_audio_chunk[fade_len:]
+
+                        # The audio to send is the mixed region + the main body of the current chunk
+                        output_to_send = torch.cat((mixed_region, current_main_body))
+                        # The previous_audio_chunk for the next iteration is the full current_audio_chunk
+                        previous_audio_chunk = current_audio_chunk
                     else:
-                        # --- No fade logic ---
-                        # Output the entire previous chunk
-                        output_chunk = previous_audio_chunk
-                        # Buffer the entire current chunk
+                        # --- No fade logic (concatenate) ---
+                        # If no fading, simply send the current chunk
+                        output_to_send = current_audio_chunk
+                        # The previous_audio_chunk for the next iteration is the full current_audio_chunk
                         previous_audio_chunk = current_audio_chunk
 
-                if output_chunk is not None:
-                    await audio_chunk_queue.put(self.audio_processor.to_pcm(output_chunk))
+                if output_to_send is not None:
+                    await audio_chunk_queue.put(self.audio_processor.to_pcm(output_to_send))
 
                 log.info(
                     f"S3Gen: Finished inference for slice {slice_num}/{total_slices} "

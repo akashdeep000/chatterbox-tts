@@ -14,7 +14,7 @@ import asyncio
 from .config import settings, tts_config
 from .dependencies import get_tts_engine, get_voice_manager
 from . import dependencies
-from .tts import TextToSpeechEngine
+from .tts import TextToSpeechEngine, InitializationState
 from .voice_manager import VoiceManager
 from fastapi import File, UploadFile
 
@@ -32,6 +32,7 @@ async def startup_event():
     logger.info("Initializing TTS engine and Voice Manager...")
     dependencies.tts_engine = TextToSpeechEngine()
     dependencies.voice_manager = VoiceManager()
+    await dependencies.tts_engine.ainit() # Call the async initialization method
     logger.info("TTS engine and Voice Manager initialized successfully.")
 
     # Warm up voice cache for all available voices
@@ -87,9 +88,20 @@ async def read_root():
 @app.get("/health")
 async def health_check():
     """
-    Health check endpoint to verify the application is running.
+    Health check endpoint to verify the application is running and TTS engine status.
     """
-    return {"status": "ok"}
+    tts_status = {"status": "ok"}
+    if dependencies.tts_engine:
+        tts_status = dependencies.tts_engine.get_initialization_status()
+        if tts_status["state"] == InitializationState.ERROR.value:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"TTS Engine Error: {tts_status['error']}")
+        elif tts_status["state"] != InitializationState.READY.value:
+            return JSONResponse(content={"status": "initializing", "tts_engine": tts_status}, status_code=status.HTTP_202_ACCEPTED)
+    else:
+        tts_status = {"state": InitializationState.NOT_STARTED.value, "progress": "TTS engine not yet instantiated", "error": None}
+        return JSONResponse(content={"status": "not_started", "tts_engine": tts_status}, status_code=status.HTTP_202_ACCEPTED)
+
+    return {"status": "ok", "tts_engine": tts_status}
 
 # --- Security ---
 api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
