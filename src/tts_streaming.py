@@ -477,7 +477,7 @@ class TextToSpeechEngine:
                     speech_tokens_for_inference = current_text_chunk_accumulated_tokens
                 else:  # zero overlap
                     speech_tokens_for_inference = token_chunk
-                log.info(f"speech_tokens_for_inference shape: {speech_tokens_for_inference.shape}")
+                log.debug(f"speech_tokens_for_inference shape: {speech_tokens_for_inference.shape}")
                 print(speech_token_queue)
 
 
@@ -529,72 +529,74 @@ class TextToSpeechEngine:
                     previous_length = new_audio_length
 
                 # These trims should apply to all methods for the respective slices
-                if params.remove_trailing_milliseconds > 0:
+                if params.remove_trailing_milliseconds > 0 and is_last_slice:
                     trim_samples = int(self.sr * params.remove_trailing_milliseconds / 1000)
                     current_audio_chunk = current_audio_chunk[:-trim_samples]
-                if params.remove_leading_milliseconds > 0:
+                if params.remove_leading_milliseconds > 0 and is_first_slice:
                     trim_samples_start = int(self.sr * params.remove_leading_milliseconds / 1000)
                     current_audio_chunk = current_audio_chunk[trim_samples_start:]
 
                 # 4. Cross-fading and Queueing
                 output_to_send = None
-                # For subsequent chunks, apply cross-fading or simply concatenate.
-                fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
-
+                output_to_send = None
                 if previous_audio_chunk is None:
-                    # This is the first chunk. We'll fade it in from silence.
-                    # To do this, we create a fake "previous" chunk of silence.
-                    previous_audio_chunk = torch.zeros(fade_len, device=self.device)
-
-                can_fade = (
-                    params.crossfade_duration_milliseconds > 0
-                    and fade_len > 0
-                    and previous_audio_chunk.shape[0] >= fade_len
-                    and current_audio_chunk.shape[0] >= fade_len
-                )
-
-                if can_fade:
-                    # --- Cross-fade logic ---
-                    # The tail of the previous chunk that will be faded out
-                    prev_tail = previous_audio_chunk[-fade_len:]
-                    # The head of the current chunk that will be faded in
-                    current_head = current_audio_chunk[:fade_len]
-                    # The main body of the current chunk that comes after the fade
-                    current_main_body = current_audio_chunk[fade_len:]
-
-                    # Equal power crossfade curves
-                    t = torch.linspace(0, 1, fade_len, device=self.device)
-                    fade_out = torch.cos(t * 0.5 * torch.pi)  # from 1 → 0
-                    fade_in = torch.sin(t * 0.5 * torch.pi)   # from 0 → 1
-
-                    # Apply fades
-                    mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
-
-                    # Combine all parts
-                    output_to_send = torch.cat((mixed_region, current_main_body))
+                    # This is the first chunk. We don't send it yet, just store it.
                     previous_audio_chunk = current_audio_chunk
                 else:
-                    # --- No fade logic (concatenate) ---
-                    # If no fading, simply send the current chunk
-                    output_to_send = current_audio_chunk
-                    # The previous_audio_chunk for the next iteration is the full current_audio_chunk
+                    # We have a previous chunk and a current chunk, so we can cross-fade.
+                    fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
+                    can_fade = (
+                        params.crossfade_duration_milliseconds > 0
+                        and fade_len > 0
+                        and previous_audio_chunk.shape[0] >= fade_len
+                        and current_audio_chunk.shape[0] >= fade_len
+                    )
+
+                    if can_fade:
+                        # --- Cross-fade logic ---
+                        # The part of the previous chunk that will be sent before the fade
+                        prev_main_body = previous_audio_chunk[:-fade_len]
+                        # The tail of the previous chunk that will be faded out
+                        prev_tail = previous_audio_chunk[-fade_len:]
+                        # The head of the current chunk that will be faded in
+                        current_head = current_audio_chunk[:fade_len]
+
+                        # Equal power crossfade curves
+                        t = torch.linspace(0, 1, fade_len, device=self.device)
+                        fade_out = torch.cos(t * 0.5 * torch.pi)  # from 1 → 0
+                        fade_in = torch.sin(t * 0.5 * torch.pi)   # from 0 → 1
+
+                        # Apply fades
+                        mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
+
+                        # The output to send is the main body of the previous chunk, plus the mixed region.
+                        output_to_send = torch.cat((prev_main_body, mixed_region))
+                    else:
+                        # --- No fade logic (send the previous chunk as is) ---
+                        output_to_send = previous_audio_chunk
+
+                    # The current chunk becomes the previous chunk for the next iteration.
                     previous_audio_chunk = current_audio_chunk
 
                 if output_to_send is not None:
-                    log.warning(f"Sending {current_audio_chunk.shape[0]} tokens to audio queue")
-                    log.warning(current_audio_chunk)
-                    await audio_chunk_queue.put(self.audio_processor.to_pcm(current_audio_chunk))
+                    log.warning(f"Sending {output_to_send.shape[0]} tokens to audio queue")
+                    await audio_chunk_queue.put(self.audio_processor.to_pcm(output_to_send))
 
-                log.info(
-                    f"S3Gen: Finished inference for slice {slice_num} "
-                    f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
-                )
                 speech_token_queue.task_done()
-
         except Exception as e:
             log.error(f"Error in S3Gen consumer task: {e}", exc_info=True)
         finally:
-            await audio_chunk_queue.put(None) # Signal end of consumption
+            # After the loop, there might be one last chunk remaining to be sent.
+            if previous_audio_chunk is not None:
+                log.debug("Sending the final remaining audio chunk.")
+                await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
+
+            await audio_chunk_queue.put(None) # Signal end of audio stream
+
+            log.info(
+                    f"S3Gen: Finished inference for slice {slice_num} "
+                    f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
+                )
 
     async def stream(
         self,
