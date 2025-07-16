@@ -440,10 +440,10 @@ class TextToSpeechEngine:
         loop = params.loop
         current_text_chunk_accumulated_tokens = None # Accumulates tokens for the current text chunk
         cache_source = torch.zeros(1, 1, 0).to(self.device) # Initialize cache_source for S3Gen streaming
-        previous_audio_chunk = None # Initialize previous_audio_chunk for cross-fading
         last_text_chunk_num = -1
         eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
         log.debug(f"S3Gen: EOS token shape: {eos_token.shape}")
+        previous_audio_chunk = None  # Initialize previous_audio_chunk for cross-fading
 
         try:
             while True:
@@ -538,7 +538,6 @@ class TextToSpeechEngine:
 
                 # 4. Cross-fading and Queueing
                 output_to_send = None
-                output_to_send = None
                 if previous_audio_chunk is None:
                     # This is the first chunk. We don't send it yet, just store it.
                     previous_audio_chunk = current_audio_chunk
@@ -571,33 +570,41 @@ class TextToSpeechEngine:
 
                         # The output to send is the main body of the previous chunk, plus the mixed region.
                         output_to_send = torch.cat((prev_main_body, mixed_region))
+
+                        # The remainder of the current chunk becomes the previous chunk for the next iteration.
+                        previous_audio_chunk = current_audio_chunk[fade_len:]
                     else:
-                        # --- No fade logic (send the previous chunk as is) ---
+                        # --- No fade logic (hard cut) ---
+                        # We still send the previous chunk, but we need to prepare the *next*
+                        # previous_audio_chunk by cutting off the overlap from the current chunk.
                         output_to_send = previous_audio_chunk
 
-                    # The current chunk becomes the previous chunk for the next iteration.
-                    previous_audio_chunk = current_audio_chunk
+                        # The remainder of the current chunk becomes the previous chunk for the next iteration.
+                        # This prevents the overlapping audio from being repeated.
+                        if fade_len > 0:
+                            previous_audio_chunk = current_audio_chunk[fade_len:]
+                        else:
+                            previous_audio_chunk = current_audio_chunk
 
                 if output_to_send is not None:
-                    log.warning(f"Sending {output_to_send.shape[0]} tokens to audio queue")
+                    log.warning(f"Sending {output_to_send.shape[0]} samples to audio queue")
                     await audio_chunk_queue.put(self.audio_processor.to_pcm(output_to_send))
 
                 speech_token_queue.task_done()
         except Exception as e:
             log.error(f"Error in S3Gen consumer task: {e}", exc_info=True)
         finally:
-            # After the loop, there might be one last chunk remaining to be sent.
-            if previous_audio_chunk is not None:
-                log.debug("Sending the final remaining audio chunk.")
+            # After the loop, send the final remaining audio chunk.
+            if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
+                log.debug(f"Sending the final remaining audio chunk of {previous_audio_chunk.shape[0]} samples.")
                 await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
 
-            await audio_chunk_queue.put(None) # Signal end of audio stream
+            await audio_chunk_queue.put(None)  # Signal end of audio stream
 
             log.info(
                     f"S3Gen: Finished inference for slice {slice_num} "
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
-            speech_token_queue.task_done()
 
     async def stream(
         self,
