@@ -446,7 +446,8 @@ class TextToSpeechEngine:
         cache_source = torch.zeros(1, 1, 0).to(self.device) # Initialize cache_source for S3Gen streaming
         last_text_chunk_num = -1
         eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
-        previous_audio_chunk = None  # Initialize previous_audio_chunk for cross-fading
+        previous_audio_chunk = None  # Stores the remainder of the last processed chunk for the next cross-fade
+        is_first_audio_chunk_sent = False # Flag to track if the very first audio chunk has been sent
 
         try:
             while True:
@@ -536,25 +537,33 @@ class TextToSpeechEngine:
 
                 # 4. Cross-fading and Queueing
                 output_to_send = None
-                if previous_audio_chunk is None:
-                    # This is the first chunk. We don't send it yet, just store it.
-                    previous_audio_chunk = current_audio_chunk
+                fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
+
+                if not is_first_audio_chunk_sent:
+                    # --- First Chunk Logic ---
+                    # Send the first chunk immediately without cross-fading.
+                    # This is critical for reducing time-to-first-audio.
+                    log.debug("First audio chunk generated. Sending immediately.")
+                    # We send the main body and store the tail for the next fade.
+                    if fade_len > 0 and current_audio_chunk.shape[0] > fade_len:
+                         output_to_send = current_audio_chunk[:-fade_len]
+                         previous_audio_chunk = current_audio_chunk[-fade_len:]
+                    else:
+                         output_to_send = current_audio_chunk
+                         previous_audio_chunk = None
+                    is_first_audio_chunk_sent = True
+
                 else:
-                    # We have a previous chunk and a current chunk, so we can cross-fade.
-                    fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
+                    # --- Standard Cross-fade Logic ---
                     can_fade = (
                         params.crossfade_duration_milliseconds > 0
                         and fade_len > 0
-                        and previous_audio_chunk.shape[0] >= fade_len
-                        and current_audio_chunk.shape[0] >= fade_len
+                        and previous_audio_chunk is not None
+                        and previous_audio_chunk.shape[0] == fade_len # Ensure prev is just the tail
+                        and current_audio_chunk.shape[0] > fade_len
                     )
 
                     if can_fade:
-                        # --- Cross-fade logic ---
-                        # The part of the previous chunk that will be sent before the fade
-                        prev_main_body = previous_audio_chunk[:-fade_len]
-                        # The tail of the previous chunk that will be faded out
-                        prev_tail = previous_audio_chunk[-fade_len:]
                         # The head of the current chunk that will be faded in
                         current_head = current_audio_chunk[:fade_len]
 
@@ -563,28 +572,30 @@ class TextToSpeechEngine:
                         fade_out = torch.cos(t * 0.5 * torch.pi)  # from 1 → 0
                         fade_in = torch.sin(t * 0.5 * torch.pi)   # from 0 → 1
 
-                        # Apply fades
-                        mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
+                        # Apply fades: fade out the previous tail and fade in the current head
+                        mixed_region = (previous_audio_chunk * fade_out) + (current_head * fade_in)
 
-                        # The output to send is the main body of the previous chunk, plus the mixed region.
-                        output_to_send = torch.cat((prev_main_body, mixed_region))
+                        # The main body of the current chunk (the part after the fade)
+                        # We also leave a tail for the *next* fade
+                        current_main_body = current_audio_chunk[fade_len:-fade_len] if current_audio_chunk.shape[0] > fade_len * 2 else torch.tensor([], device=self.device)
 
-                        # The remainder of the current chunk becomes the previous chunk for the next iteration.
-                        previous_audio_chunk = current_audio_chunk[fade_len:]
+
+                        # The output to send is the mixed region plus the main body of the current chunk.
+                        output_to_send = torch.cat((mixed_region, current_main_body))
+
+                        # The tail of the current chunk becomes the 'previous_audio_chunk' for the next iteration.
+                        previous_audio_chunk = current_audio_chunk[-fade_len:]
                     else:
-                        # --- No fade logic (hard cut) ---
-                        # We still send the previous chunk, but we need to prepare the *next*
-                        # previous_audio_chunk by cutting off the overlap from the current chunk.
+                        # --- No fade / Fallback ---
+                        # Send the previous chunk (if any) and prepare the current one for the next iteration.
                         output_to_send = previous_audio_chunk
-
-                        # The remainder of the current chunk becomes the previous chunk for the next iteration.
-                        # This prevents the overlapping audio from being repeated.
-                        if fade_len > 0:
-                            previous_audio_chunk = current_audio_chunk[fade_len:]
+                        if fade_len > 0 and current_audio_chunk.shape[0] > fade_len:
+                            # We can't fade, so just send the previous part and save the new tail
+                            previous_audio_chunk = current_audio_chunk[-fade_len:]
                         else:
-                            previous_audio_chunk = current_audio_chunk
+                            previous_audio_chunk = current_audio_chunk # Or store the whole thing if it's too short
 
-                if output_to_send is not None:
+                if output_to_send is not None and output_to_send.shape[0] > 0:
                     log.debug(f"Sending {output_to_send.shape[0]} samples to audio queue")
                     pcm_data = await self.audio_processor.to_pcm(output_to_send, loop)
                     await audio_chunk_queue.put(pcm_data)
@@ -593,9 +604,9 @@ class TextToSpeechEngine:
         except Exception as e:
             log.error(f"Error in S3Gen consumer task: {e}", exc_info=True)
         finally:
-            # After the loop, send the final remaining audio chunk.
+            # After the loop, send any final remaining audio chunk (likely the last tail).
             if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
-                log.debug(f"Sending the final remaining audio chunk of {previous_audio_chunk.shape[0]} samples.")
+                log.debug(f"Sending the final remaining audio tail of {previous_audio_chunk.shape[0]} samples.")
                 pcm_data = await self.audio_processor.to_pcm(previous_audio_chunk, loop)
                 await audio_chunk_queue.put(pcm_data)
 
