@@ -9,13 +9,15 @@ and audio generation with performance optimizations.
 # Standard library imports
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional, Generator, AsyncGenerator
+from typing import Literal, Optional, Generator, AsyncGenerator, AsyncIterator
 import io
 import gc
 import asyncio
 import time
 import functools
 from enum import Enum
+
+from .audio_encoding import AudioEncoder
 
 
 class InitializationState(Enum):
@@ -107,25 +109,26 @@ class SynthesisParams:
 class _AudioProcessor:
     """Handles audio processing tasks like WAV header creation and PCM conversion."""
 
-    @staticmethod
-    def create_wav_header(sample_rate: int, channels: int = 1, sample_width: int = 2) -> bytes:
-        """Creates a WAV file header for streaming."""
-        data_size = 0xFFFFFFFF  # Set to 0xFFFFFFFF for streaming to indicate unknown size
-        header = io.BytesIO()
-        header.write(b'RIFF')
-        header.write((data_size).to_bytes(4, 'little')) # Set to data_size (0xFFFFFFFF) for streaming
-        header.write(b'WAVEfmt ')
-        header.write((16).to_bytes(4, 'little'))
-        header.write((1).to_bytes(2, 'little'))
-        header.write(channels.to_bytes(2, 'little'))
-        header.write(sample_rate.to_bytes(4, 'little'))
-        header.write((sample_rate * channels * sample_width).to_bytes(4, 'little'))
-        header.write((channels * sample_width).to_bytes(2, 'little'))
-        header.write((sample_width * 8).to_bytes(2, 'little'))
-        header.write(b'data')
-        header.write(data_size.to_bytes(4, 'little'))
-        header.seek(0)
-        return header.read()
+    # TODO: Remove this method once we can stream the WAV header
+    # @staticmethod
+    # def create_wav_header(sample_rate: int, channels: int = 1, sample_width: int = 2) -> bytes:
+    #     """Creates a WAV file header for streaming."""
+    #     data_size = 0xFFFFFFFF  # Set to 0xFFFFFFFF for streaming to indicate unknown size
+    #     header = io.BytesIO()
+    #     header.write(b'RIFF')
+    #     header.write((data_size).to_bytes(4, 'little')) # Set to data_size (0xFFFFFFFF) for streaming
+    #     header.write(b'WAVEfmt ')
+    #     header.write((16).to_bytes(4, 'little'))
+    #     header.write((1).to_bytes(2, 'little'))
+    #     header.write(channels.to_bytes(2, 'little'))
+    #     header.write(sample_rate.to_bytes(4, 'little'))
+    #     header.write((sample_rate * channels * sample_width).to_bytes(4, 'little'))
+    #     header.write((channels * sample_width).to_bytes(2, 'little'))
+    #     header.write((sample_width * 8).to_bytes(2, 'little'))
+    #     header.write(b'data')
+    #     header.write(data_size.to_bytes(4, 'little'))
+    #     header.seek(0)
+    #     return header.read()
 
     @staticmethod
     async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop) -> bytes:
@@ -344,7 +347,6 @@ class TextToSpeechEngine:
         speech_token_queue: asyncio.Queue,
         params: SynthesisParams,
         stream: torch.cuda.Stream,
-        # next_chunk_event: asyncio.Event, # Removed for true streaming
     ):
         """Producer task for T3 model. Generates speech tokens and puts them into a queue."""
         num_chunks = len(text_chunks)
@@ -436,7 +438,7 @@ class TextToSpeechEngine:
     async def _s3gen_consumer_task(
         self,
         speech_token_queue: asyncio.Queue,
-        audio_chunk_queue: asyncio.Queue,
+        pcm_chunk_queue: asyncio.Queue,
         params: SynthesisParams,
         stream: torch.cuda.Stream,
     ):
@@ -598,7 +600,7 @@ class TextToSpeechEngine:
                 if output_to_send is not None and output_to_send.shape[0] > 0:
                     log.debug(f"Sending {output_to_send.shape[0]} samples to audio queue")
                     pcm_data = await self.audio_processor.to_pcm(output_to_send, loop)
-                    await audio_chunk_queue.put(pcm_data)
+                    await pcm_chunk_queue.put(pcm_data)
 
                 speech_token_queue.task_done()
         except Exception as e:
@@ -608,9 +610,9 @@ class TextToSpeechEngine:
             if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
                 log.debug(f"Sending the final remaining audio tail of {previous_audio_chunk.shape[0]} samples.")
                 pcm_data = await self.audio_processor.to_pcm(previous_audio_chunk, loop)
-                await audio_chunk_queue.put(pcm_data)
+                await pcm_chunk_queue.put(pcm_data)
 
-            await audio_chunk_queue.put(None)  # Signal end of audio stream
+            await pcm_chunk_queue.put(None)  # Signal end of audio stream
 
             log.info(
                     f"S3Gen: Finished inference for slice {slice_num} "
@@ -620,6 +622,7 @@ class TextToSpeechEngine:
     async def stream(
         self,
         text: str,
+        output_format: str = "wav",
         voice_id: Optional[str] = None,
         voice_exaggeration_factor: float = tts_config.VOICE_EXAGGERATION_FACTOR,
         cfg_guidance_weight: float = tts_config.CFG_GUIDANCE_WEIGHT,
@@ -632,24 +635,16 @@ class TextToSpeechEngine:
         crossfade_duration_milliseconds: int = tts_config.CROSSFADE_DURATION_MILLISECONDS,
         start_time: Optional[float] = None,
     ) -> AsyncGenerator[bytes, None]:
-        """Streams synthesized audio using a producer-consumer pattern."""
+        """Streams synthesized audio in the specified format."""
         loop = asyncio.get_running_loop()
         audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
         conds = await self._prepare_and_get_conds(audio_prompt_path, voice_exaggeration_factor, loop)
+        yield_count = 0 # Counts the number of chunks yielded to the client
 
-        # Split text into chunks for processing
         text_chunks = split_text_into_chunks(text, text_processing_chunk_size)
-        text_chunk_count = len(text_chunks)
-
-        # These queues buffer speech tokens and audio chunks
-        speech_token_queue = asyncio.Queue(maxsize=20) # Buffer for T3 output slices
-        audio_chunk_queue = asyncio.Queue(maxsize=10) # Buffer for final audio chunks
-
-        # next_chunk_event is removed as queue backpressure is primary flow control
-        # next_chunk_event = asyncio.Event()
 
         params = SynthesisParams(
-            text_tokens=None, # text_tokens are now processed per chunk
+            text_tokens=None,
             conds=conds,
             cfg_guidance_weight=cfg_guidance_weight,
             synthesis_temperature=synthesis_temperature,
@@ -660,40 +655,41 @@ class TextToSpeechEngine:
             chunk_overlap_strategy=chunk_overlap_strategy,
             crossfade_duration_milliseconds=crossfade_duration_milliseconds,
             loop=loop,
-            text_chunk_count=text_chunk_count,
-            # next_chunk_event=next_chunk_event # Removed
+            text_chunk_count=len(text_chunks),
         )
 
-        yield self.audio_processor.create_wav_header(self.sr)
+        speech_token_queue = asyncio.Queue(maxsize=2)
+        pcm_chunk_queue = asyncio.Queue(maxsize=2)
 
         producer_task = loop.create_task(
-            self._t3_producer_task(
-                text_chunks,
-                speech_token_queue,
-                params,
-                self.t3_stream,
-                # next_chunk_event # Removed
-            )
+            self._t3_producer_task(text_chunks, speech_token_queue, params, self.t3_stream)
         )
         consumer_task = loop.create_task(
-            self._s3gen_consumer_task(
-                speech_token_queue,
-                audio_chunk_queue,
-                params,
-                self.s3gen_stream,
-                # next_chunk_event # Removed
-            )
+            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, params, self.s3gen_stream)
         )
 
-        try:
+        async def pcm_generator():
+            """Async generator to yield PCM chunks from the queue."""
             while True:
-                audio_chunk = await audio_chunk_queue.get()
-                if audio_chunk is None:
+                chunk = await pcm_chunk_queue.get()
+                if chunk is None:
                     break
-                yield audio_chunk
-                audio_chunk_queue.task_done()
+                yield chunk
+                pcm_chunk_queue.task_done()
+
+        encoder = AudioEncoder(output_format, self.sr)
+        encoded_stream = encoder.encode(pcm_generator())
+
+        try:
+            async for encoded_chunk in encoded_stream:
+                yield_count += 1
+                log.info(f"Sending {len(encoded_chunk)} bytes to client (chunk {yield_count})")
+                yield encoded_chunk
+
         finally:
+            # This block now correctly waits for the client to be done, then cleans up.
+            log.info("Client stream finished or disconnected. Cleaning up TTS tasks.")
             producer_task.cancel()
             consumer_task.cancel()
             await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
-            log.info("Streaming tasks cancelled and gathered.")
+            log.info("TTS generation tasks cancelled and gathered.")

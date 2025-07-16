@@ -160,7 +160,7 @@ document.addEventListener('DOMContentLoaded', () => {
         stopTtsButton.disabled = true;
     }
 
-    function generateTtsRest() {
+    async function generateTts() {
         if (!apiKey || !ttsTextInput.value || !ttsVoiceSelect.value) return;
 
         generateTtsButton.textContent = 'Generating...';
@@ -168,11 +168,15 @@ document.addEventListener('DOMContentLoaded', () => {
         stopTtsButton.disabled = false;
         streamingLog.innerHTML = '';
 
+        abortController = new AbortController();
+        const signal = abortController.signal;
+
+        const useMse = document.getElementById('format-select').value === 'fmp4';
+
         const url = new URL('/tts/generate', baseUrl);
         url.searchParams.append('text', ttsTextInput.value);
         url.searchParams.append('voice_id', ttsVoiceSelect.value);
         url.searchParams.append('api_key', apiKey);
-
         // Append TTS settings to URL
         url.searchParams.append('text_processing_chunk_size', textProcessingChunkSizeInput.value);
         url.searchParams.append('audio_tokens_per_slice', audioTokensPerSliceInput.value);
@@ -181,26 +185,85 @@ document.addEventListener('DOMContentLoaded', () => {
         url.searchParams.append('chunk_overlap_strategy', chunkOverlapStrategySelect.value);
         url.searchParams.append('crossfade_duration_milliseconds', crossfadeDurationMillisecondsInput.value);
 
-        ttsAudio.src = url.toString();
-        ttsAudio.play();
+        const headers = { 'X-API-Key': apiKey };
+        if (useMse) {
+            headers['Accept'] = 'audio/mp4';
+        } else {
+            headers['Accept'] = document.getElementById('format-select').value === 'mp3' ? 'audio/mpeg' : 'audio/wav';
+        }
+
+        if (useMse) {
+            const mediaSource = new MediaSource();
+            ttsAudio.src = URL.createObjectURL(mediaSource);
+
+            mediaSource.addEventListener('sourceopen', async () => {
+                URL.revokeObjectURL(ttsAudio.src);
+                const sourceBuffer = mediaSource.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+
+                try {
+                    const response = await fetch(url, { headers, signal });
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+                    const reader = response.body.getReader();
+
+                    const appendNextChunk = async () => {
+                        const { done, value } = await reader.read();
+                        if (done) {
+                            if (mediaSource.readyState === 'open') mediaSource.endOfStream();
+                            resetTtsControls();
+                            return;
+                        }
+                        sourceBuffer.appendBuffer(value);
+                    };
+
+                    sourceBuffer.addEventListener('updateend', appendNextChunk);
+                    appendNextChunk(); // Start the process
+
+                } catch (error) {
+                    if (error.name !== 'AbortError') {
+                        console.error('Error during TTS generation:', error);
+                        showMessage('Failed to generate TTS.', 'error');
+                    }
+                    resetTtsControls();
+                }
+            });
+        } else {
+            // Direct playback for WAV and MP3
+            try {
+                // The abortController is not used here, but the stop button will still work
+                // by pausing and resetting the src. The 'onerror' handler will catch errors.
+                ttsAudio.src = url.toString();
+            } catch (error) {
+                console.error('Error setting audio source:', error);
+                showMessage('Failed to generate TTS.', 'error');
+                resetTtsControls();
+            }
+        }
+
+        ttsAudio.play().catch(e => {
+            console.error("Audio play failed:", e);
+            resetTtsControls();
+        });
 
         ttsAudio.onended = () => {
             resetTtsControls();
         };
 
-        ttsAudio.onerror = () => {
+        ttsAudio.onerror = (e) => {
+            console.error("Audio element error:", e);
             showMessage('Failed to play audio.', 'error');
             resetTtsControls();
         };
     }
 
-    generateTtsButton.addEventListener('click', () => {
-        generateTtsRest();
-    });
+    generateTtsButton.addEventListener('click', generateTts);
 
     stopTtsButton.addEventListener('click', () => {
+        if (abortController) {
+            abortController.abort();
+        }
         ttsAudio.pause();
-        ttsAudio.src = ""; // Stop the stream
+        ttsAudio.src = "";
         resetTtsControls();
     });
 

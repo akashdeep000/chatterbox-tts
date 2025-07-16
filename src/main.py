@@ -136,6 +136,19 @@ class TTSRequest(BaseModel):
     chunk_overlap_strategy: str = tts_config.CHUNK_OVERLAP_STRATEGY
     crossfade_duration_milliseconds: int = tts_config.CROSSFADE_DURATION_MILLISECONDS
 
+def get_output_format_and_media_type(accept_header: Optional[str]) -> (str, str):
+    """Parses the Accept header to determine the output format and media type."""
+    if accept_header:
+        # Simple parsing, can be made more robust
+        if "audio/mpeg" in accept_header:
+            return "mp3", "audio/mpeg"
+        if "video/mp4" in accept_header or "audio/mp4" in accept_header:
+            return "fmp4", "audio/mp4"
+        if "audio/pcm" in accept_header:
+            return "raw_pcm", "audio/pcm"
+    return "wav", "audio/wav"
+
+
 @app.api_route("/tts/generate", methods=["GET", "POST"], dependencies=[Depends(get_api_key)])
 async def tts_generate(
     request: Request,
@@ -156,7 +169,6 @@ async def tts_generate(
         tts_request = TTSRequest(
             text=query_params.get("text"),
             voice_id=query_params.get("voice_id"),
-            # voice_exaggeration_factor=float(query_params.get("voice_exaggeration_factor", tts_config.VOICE_EXAGGERATION_FACTOR)), # can't use this for efficient caching
             cfg_guidance_weight=float(query_params.get("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT)),
             synthesis_temperature=float(query_params.get("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE)),
             text_processing_chunk_size=int(query_params.get("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE)),
@@ -170,13 +182,16 @@ async def tts_generate(
     if not tts_request.text:
         return JSONResponse(content={"error": "Text is required"}, status_code=400)
 
+    accept_header = request.headers.get("Accept")
+    output_format, media_type = get_output_format_and_media_type(accept_header)
+
     try:
-        logger.info(f"Received TTS request for voice_id: {tts_request.voice_id}")
+        logger.info(f"Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format})")
         start_time = time.time()
         audio_stream = tts_engine.stream(
             text=tts_request.text,
+            output_format=output_format,
             voice_id=tts_request.voice_id,
-            # voice_exaggeration_factor=tts_request.voice_exaggeration_factor, # can't use this for efficient caching
             cfg_guidance_weight=tts_request.cfg_guidance_weight,
             synthesis_temperature=tts_request.synthesis_temperature,
             text_processing_chunk_size=tts_request.text_processing_chunk_size,
@@ -187,7 +202,7 @@ async def tts_generate(
             crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
             start_time=start_time
         )
-        return StreamingResponse(audio_stream, media_type="audio/wav")
+        return StreamingResponse(audio_stream, media_type=media_type)
     except Exception as e:
         logger.error(f"TTS generation failed: {e}", exc_info=True)
         return JSONResponse(content={"error": "Internal server error"}, status_code=500)

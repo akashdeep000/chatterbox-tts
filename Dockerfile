@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     curl \
     git \
+    ffmpeg \
     build-essential && \
     rm -rf /var/lib/apt/lists/*
 
