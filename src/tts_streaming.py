@@ -501,18 +501,24 @@ class TextToSpeechEngine:
                     speech_tokens_for_inference = F.pad(speech_tokens_for_inference, (0, padding_needed), "constant", 0)
 
                 # 2. S3Gen Inference (blocking)
+                inference_kwargs = {
+                    "speech_tokens": speech_tokens_for_inference,
+                    "ref_dict": params.conds.gen, # Always use the initial ref_dict
+                }
+                if params.chunk_overlap_strategy == "full":
+                    inference_kwargs["cache_source"] = cache_source # Pass the cache_source for streaming
+
                 partial_inference = functools.partial(
                     self.tts.s3gen.inference,
-                    speech_tokens=speech_tokens_for_inference,
-                    ref_dict=params.conds.gen, # Always use the initial ref_dict
-                    cache_source=cache_source # Pass the cache_source for streaming
+                    **inference_kwargs
                 )
                 with torch.cuda.stream(stream):
                     wav, new_cache_source = await loop.run_in_executor(None, partial_inference)
                 current_audio_chunk = wav.squeeze(0).detach()
 
-                # Update cache_source for the next iteration within the same text chunk
-                cache_source = new_cache_source
+                if params.chunk_overlap_strategy == "full":
+                    # Update cache_source for the next iteration within the same text chunk
+                    cache_source = new_cache_source
 
 
                 # 3. Post-processing based on overlap method
@@ -523,65 +529,56 @@ class TextToSpeechEngine:
                     previous_length = new_audio_length
 
                 # These trims should apply to all methods for the respective slices
-                if params.remove_trailing_milliseconds > 0 and is_last_slice and is_last_text_chunk:
+                if params.remove_trailing_milliseconds > 0:
                     trim_samples = int(self.sr * params.remove_trailing_milliseconds / 1000)
                     current_audio_chunk = current_audio_chunk[:-trim_samples]
-                if params.remove_leading_milliseconds > 0 and is_first_slice and is_first_text_chunk:
+                if params.remove_leading_milliseconds > 0:
                     trim_samples_start = int(self.sr * params.remove_leading_milliseconds / 1000)
                     current_audio_chunk = current_audio_chunk[trim_samples_start:]
 
                 # 4. Cross-fading and Queueing
                 output_to_send = None
+                # For subsequent chunks, apply cross-fading or simply concatenate.
+                fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
+
                 if previous_audio_chunk is None:
-                     # Apply optional fade-in to the first chunk to avoid pop
-                    fade_in_len = int(self.sr * 0.01)  # 10ms fade-in
-                    if current_audio_chunk.shape[0] >= fade_in_len:
-                        current_audio_chunk = current_audio_chunk.clone()
-                        t = torch.linspace(0, 1, fade_in_len, device=self.device)
-                        fade_curve = torch.sin(t * 0.5 * torch.pi)
-                        current_audio_chunk[:fade_in_len] *= fade_curve
-                    # This is the very first chunk. Send it immediately.
-                    output_to_send = current_audio_chunk
-                    # For the next iteration, this current_audio_chunk becomes the 'previous' one.
+                    # This is the first chunk. We'll fade it in from silence.
+                    # To do this, we create a fake "previous" chunk of silence.
+                    previous_audio_chunk = torch.zeros(fade_len, device=self.device)
+
+                can_fade = (
+                    params.crossfade_duration_milliseconds > 0
+                    and fade_len > 0
+                    and previous_audio_chunk.shape[0] >= fade_len
+                    and current_audio_chunk.shape[0] >= fade_len
+                )
+
+                if can_fade:
+                    # --- Cross-fade logic ---
+                    # The tail of the previous chunk that will be faded out
+                    prev_tail = previous_audio_chunk[-fade_len:]
+                    # The head of the current chunk that will be faded in
+                    current_head = current_audio_chunk[:fade_len]
+                    # The main body of the current chunk that comes after the fade
+                    current_main_body = current_audio_chunk[fade_len:]
+
+                    # Equal power crossfade curves
+                    t = torch.linspace(0, 1, fade_len, device=self.device)
+                    fade_out = torch.cos(t * 0.5 * torch.pi)  # from 1 → 0
+                    fade_in = torch.sin(t * 0.5 * torch.pi)   # from 0 → 1
+
+                    # Apply fades
+                    mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
+
+                    # Combine all parts
+                    output_to_send = torch.cat((mixed_region, current_main_body))
                     previous_audio_chunk = current_audio_chunk
                 else:
-                    # For subsequent chunks, apply cross-fading or simply concatenate.
-                    fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
-                    can_fade = (
-                        params.crossfade_duration_milliseconds > 0
-                        and fade_len > 0
-                        and previous_audio_chunk.shape[0] >= fade_len
-                        and current_audio_chunk.shape[0] >= fade_len
-                    )
-
-                    if can_fade:
-                        # --- Cross-fade logic ---
-                        # The part of the previous chunk that will be sent before the fade
-                        prev_main_body = previous_audio_chunk[:-fade_len]
-                        # The tail of the previous chunk that will be faded out
-                        prev_tail = previous_audio_chunk[-fade_len:]
-                        # The head of the current chunk that will be faded in
-                        current_head = current_audio_chunk[:fade_len]
-                        # The main body of the current chunk that comes after the fade
-                        current_main_body = current_audio_chunk[fade_len:]
-
-                        # Equal power crossfade curves
-                        t = torch.linspace(0, 1, fade_len, device=self.device)
-                        fade_out = torch.cos(t * 0.5 * torch.pi)  # from 1 → 0
-                        fade_in = torch.sin(t * 0.5 * torch.pi)   # from 0 → 1
-
-                        # Apply fades
-                        mixed_region = (prev_tail * fade_out) + (current_head * fade_in)
-
-                        # Combine all parts
-                        output_to_send = torch.cat((mixed_region, current_main_body))
-                        previous_audio_chunk = current_audio_chunk
-                    else:
-                        # --- No fade logic (concatenate) ---
-                        # If no fading, simply send the current chunk
-                        output_to_send = current_audio_chunk
-                        # The previous_audio_chunk for the next iteration is the full current_audio_chunk
-                        previous_audio_chunk = current_audio_chunk
+                    # --- No fade logic (concatenate) ---
+                    # If no fading, simply send the current chunk
+                    output_to_send = current_audio_chunk
+                    # The previous_audio_chunk for the next iteration is the full current_audio_chunk
+                    previous_audio_chunk = current_audio_chunk
 
                 if output_to_send is not None:
                     log.warning(f"Sending {current_audio_chunk.shape[0]} tokens to audio queue")
@@ -593,13 +590,6 @@ class TextToSpeechEngine:
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
                 speech_token_queue.task_done()
-
-                # In the new streaming approach, the consumer does not signal the producer
-                # based on a trigger point within a chunk. Backpressure is handled by the queue.
-                # The next_chunk_event is no longer passed to this task.
-                # if slice_num == trigger_point and text_chunk_num < params.text_chunk_count:
-                #     log.info(f"S3Gen: Reached trigger point for chunk {text_chunk_num}. Signaling producer for next chunk.")
-                #     next_chunk_event.set()
 
         except Exception as e:
             log.error(f"Error in S3Gen consumer task: {e}", exc_info=True)

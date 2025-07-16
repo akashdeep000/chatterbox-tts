@@ -1,6 +1,8 @@
 document.addEventListener('DOMContentLoaded', () => {
     const apiKeyInput = document.getElementById('api-key');
     const saveApiKeyButton = document.getElementById('save-api-key');
+    const baseUrlInput = document.getElementById('base-url');
+    const saveBaseUrlButton = document.getElementById('save-base-url');
     const voiceList = document.getElementById('voice-list');
     const voiceFileInput = document.getElementById('voice-file');
     const uploadVoiceButton = document.getElementById('upload-voice');
@@ -25,6 +27,11 @@ document.addEventListener('DOMContentLoaded', () => {
     let apiKey = localStorage.getItem('apiKey');
     if (apiKey) {
         apiKeyInput.value = apiKey;
+    }
+
+    let baseUrl = localStorage.getItem('baseUrl') || window.location.origin;
+    if (baseUrl) {
+        baseUrlInput.value = baseUrl;
     }
 
     // Load TTS settings from localStorage
@@ -54,10 +61,17 @@ document.addEventListener('DOMContentLoaded', () => {
         loadVoices();
     });
 
+    saveBaseUrlButton.addEventListener('click', () => {
+        baseUrl = baseUrlInput.value;
+        localStorage.setItem('baseUrl', baseUrl);
+        showMessage('Base URL saved!', 'success');
+        loadVoices();
+    });
+
     async function loadVoices() {
         if (!apiKey) return;
         try {
-            const response = await fetch('/voices', {
+            const response = await fetch(`${baseUrl}/voices`, {
                 headers: { 'X-API-Key': apiKey }
             });
             if (!response.ok) {
@@ -99,7 +113,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function deleteVoice(voiceId) {
         if (!apiKey) return;
         try {
-            const response = await fetch(`/voices/${voiceId}`, {
+            const response = await fetch(`${baseUrl}/voices/${voiceId}`, {
                 method: 'DELETE',
                 headers: { 'X-API-Key': apiKey }
             });
@@ -121,7 +135,7 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             uploadVoiceButton.textContent = 'Uploading...';
             uploadVoiceButton.disabled = true;
-            const response = await fetch('/voices', {
+            const response = await fetch(`${baseUrl}/voices`, {
                 method: 'POST',
                 headers: { 'X-API-Key': apiKey },
                 body: formData
@@ -154,7 +168,7 @@ document.addEventListener('DOMContentLoaded', () => {
         stopTtsButton.disabled = false;
         streamingLog.innerHTML = '';
 
-        const url = new URL('/tts/generate', window.location.origin);
+        const url = new URL('/tts/generate', baseUrl);
         url.searchParams.append('text', ttsTextInput.value);
         url.searchParams.append('voice_id', ttsVoiceSelect.value);
         url.searchParams.append('api_key', apiKey);

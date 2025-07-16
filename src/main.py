@@ -126,7 +126,7 @@ async def get_api_key(
 class TTSRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
-    voice_exaggeration_factor: float = tts_config.VOICE_EXAGGERATION_FACTOR
+    # voice_exaggeration_factor: float = tts_config.VOICE_EXAGGERATION_FACTOR # can't use this for efficient caching
     cfg_guidance_weight: float = tts_config.CFG_GUIDANCE_WEIGHT
     synthesis_temperature: float = tts_config.SYNTHESIS_TEMPERATURE
     text_processing_chunk_size: Optional[int] = tts_config.TEXT_PROCESSING_CHUNK_SIZE
@@ -156,7 +156,7 @@ async def tts_generate(
         tts_request = TTSRequest(
             text=query_params.get("text"),
             voice_id=query_params.get("voice_id"),
-            voice_exaggeration_factor=float(query_params.get("voice_exaggeration_factor", tts_config.VOICE_EXAGGERATION_FACTOR)),
+            # voice_exaggeration_factor=float(query_params.get("voice_exaggeration_factor", tts_config.VOICE_EXAGGERATION_FACTOR)), # can't use this for efficient caching
             cfg_guidance_weight=float(query_params.get("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT)),
             synthesis_temperature=float(query_params.get("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE)),
             text_processing_chunk_size=int(query_params.get("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE)),
@@ -176,7 +176,7 @@ async def tts_generate(
         audio_stream = tts_engine.stream(
             text=tts_request.text,
             voice_id=tts_request.voice_id,
-            voice_exaggeration_factor=tts_request.voice_exaggeration_factor,
+            # voice_exaggeration_factor=tts_request.voice_exaggeration_factor, # can't use this for efficient caching
             cfg_guidance_weight=tts_request.cfg_guidance_weight,
             synthesis_temperature=tts_request.synthesis_temperature,
             text_processing_chunk_size=tts_request.text_processing_chunk_size,
