@@ -128,13 +128,21 @@ class _AudioProcessor:
         return header.read()
 
     @staticmethod
-    def to_pcm(audio_tensor: torch.Tensor) -> bytes:
-        """Converts an audio tensor to PCM byte data."""
-        audio_tensor_clamped = torch.clamp(audio_tensor.cpu(), -1.0, 1.0)
-        audio_tensor_int = (audio_tensor_clamped * 32767).to(torch.int16)
-        pcm_data = audio_tensor_int.numpy().tobytes()
-        safe_delete_tensors(audio_tensor, audio_tensor_clamped, audio_tensor_int)
-        return pcm_data
+    async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop) -> bytes:
+        """
+        Converts an audio tensor to PCM byte data asynchronously to avoid blocking.
+        The tensor is moved to the CPU and converted inside a thread pool executor.
+        """
+        def _blocking_conversion():
+            """The synchronous part of the conversion."""
+            audio_tensor_clamped = torch.clamp(audio_tensor.cpu(), -1.0, 1.0)
+            audio_tensor_int = (audio_tensor_clamped * 32767).to(torch.int16)
+            pcm_data = audio_tensor_int.numpy().tobytes()
+            safe_delete_tensors(audio_tensor, audio_tensor_clamped, audio_tensor_int)
+            return pcm_data
+
+        # Offload the blocking CPU operations to a separate thread
+        return await loop.run_in_executor(None, _blocking_conversion)
 
 
 class TextToSpeechEngine:
@@ -397,8 +405,6 @@ class TextToSpeechEngine:
                         current_slice = current_slice[params.audio_tokens_per_slice:]
                         # Concatenate all predicted tokens along the sequence dimension.
                         predicted_tokens = torch.cat(slice_to_send, dim=1)  # shape: (B, num_tokens)
-                        log.debug(f"Sending {len(slice_to_send)} tokens to s3gen queue, tensor shape: {predicted_tokens.shape}")
-                        print(predicted_tokens)
                         slice_idx += 1
                         is_first_slice = (slice_idx == 1)
                         await speech_token_queue.put(
@@ -410,8 +416,6 @@ class TextToSpeechEngine:
                         is_first_slice = (slice_idx == 1)
                         # Concatenate all predicted tokens along the sequence dimension.
                         predicted_tokens = torch.cat(current_slice, dim=1)  # shape: (B, num_tokens)
-                        log.debug(f"Sending {len(predicted_tokens)} tokens to speech token queue, tensor shape: {predicted_tokens.shape}")
-                        print(predicted_tokens)
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk) # shape: (B, num_tokens)
                         )
@@ -442,13 +446,11 @@ class TextToSpeechEngine:
         cache_source = torch.zeros(1, 1, 0).to(self.device) # Initialize cache_source for S3Gen streaming
         last_text_chunk_num = -1
         eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
-        log.debug(f"S3Gen: EOS token shape: {eos_token.shape}")
         previous_audio_chunk = None  # Initialize previous_audio_chunk for cross-fading
 
         try:
             while True:
                 queue_item = await speech_token_queue.get()
-                log.warning(queue_item)
                 if queue_item is None:
                     # End of stream. No more audio to process.
                     # The last chunk should have already been sent by the main loop.
@@ -459,8 +461,6 @@ class TextToSpeechEngine:
                     f"S3Gen: Starting inference for slice {slice_num} "
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
-                log.debug(f"S3Gen: Starting inference for slice {slice_num}, shape: {token_chunk.shape}")
-
                 # Reset state for new text chunks
                 if text_chunk_num != last_text_chunk_num:
                     current_text_chunk_accumulated_tokens = None # Reset for new text chunk
@@ -477,8 +477,6 @@ class TextToSpeechEngine:
                     speech_tokens_for_inference = current_text_chunk_accumulated_tokens
                 else:  # zero overlap
                     speech_tokens_for_inference = token_chunk
-                log.debug(f"speech_tokens_for_inference shape: {speech_tokens_for_inference.shape}")
-                print(speech_token_queue)
 
 
                 # Apply EOS token only for the last slice of the current text chunk
@@ -587,8 +585,9 @@ class TextToSpeechEngine:
                             previous_audio_chunk = current_audio_chunk
 
                 if output_to_send is not None:
-                    log.warning(f"Sending {output_to_send.shape[0]} samples to audio queue")
-                    await audio_chunk_queue.put(self.audio_processor.to_pcm(output_to_send))
+                    log.debug(f"Sending {output_to_send.shape[0]} samples to audio queue")
+                    pcm_data = await self.audio_processor.to_pcm(output_to_send, loop)
+                    await audio_chunk_queue.put(pcm_data)
 
                 speech_token_queue.task_done()
         except Exception as e:
@@ -597,7 +596,8 @@ class TextToSpeechEngine:
             # After the loop, send the final remaining audio chunk.
             if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
                 log.debug(f"Sending the final remaining audio chunk of {previous_audio_chunk.shape[0]} samples.")
-                await audio_chunk_queue.put(self.audio_processor.to_pcm(previous_audio_chunk))
+                pcm_data = await self.audio_processor.to_pcm(previous_audio_chunk, loop)
+                await audio_chunk_queue.put(pcm_data)
 
             await audio_chunk_queue.put(None)  # Signal end of audio stream
 
@@ -631,7 +631,7 @@ class TextToSpeechEngine:
         text_chunk_count = len(text_chunks)
 
         # These queues buffer speech tokens and audio chunks
-        speech_token_queue = asyncio.Queue(maxsize=10) # Buffer for T3 output slices
+        speech_token_queue = asyncio.Queue(maxsize=2) # Buffer for T3 output slices
         audio_chunk_queue = asyncio.Queue(maxsize=2) # Buffer for final audio chunks
 
         # next_chunk_event is removed as queue backpressure is primary flow control
