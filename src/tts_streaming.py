@@ -597,6 +597,7 @@ class TextToSpeechEngine:
                     f"S3Gen: Finished inference for slice {slice_num} "
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
+            speech_token_queue.task_done()
 
     async def stream(
         self,
