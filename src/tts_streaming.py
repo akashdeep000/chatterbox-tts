@@ -642,8 +642,8 @@ class TextToSpeechEngine:
         text_chunk_count = len(text_chunks)
 
         # These queues buffer speech tokens and audio chunks
-        speech_token_queue = asyncio.Queue(maxsize=2) # Buffer for T3 output slices
-        audio_chunk_queue = asyncio.Queue(maxsize=2) # Buffer for final audio chunks
+        speech_token_queue = asyncio.Queue(maxsize=20) # Buffer for T3 output slices
+        audio_chunk_queue = asyncio.Queue(maxsize=10) # Buffer for final audio chunks
 
         # next_chunk_event is removed as queue backpressure is primary flow control
         # next_chunk_event = asyncio.Event()
