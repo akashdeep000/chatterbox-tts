@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Chatterbox TTS</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
+
 <body>
     <h1>Chatterbox TTS</h1>
 
@@ -34,6 +36,33 @@
         <div id="streaming-log"></div>
     </div>
 
+    <div class="container">
+        <h2>TTS Settings</h2>
+        <label for="text-processing-chunk-size">Text Processing Chunk Size:</label>
+        <input type="number" id="text-processing-chunk-size" value="100">
+
+        <label for="audio-tokens-per-slice">Audio Tokens Per Slice:</label>
+        <input type="number" id="audio-tokens-per-slice" value="35">
+
+        <label for="remove-leading-milliseconds">Remove Leading Milliseconds:</label>
+        <input type="number" id="remove-leading-milliseconds" value="0">
+
+        <label for="remove-trailing-milliseconds">Remove Trailing Milliseconds:</label>
+        <input type="number" id="remove-trailing-milliseconds" value="0">
+
+        <label for="chunk-overlap-strategy">Chunk Overlap Strategy:</label>
+        <select id="chunk-overlap-strategy">
+            <option value="full">full</option>
+            <option value="zero">zero</option>
+        </select>
+
+        <label for="crossfade-duration-milliseconds">Crossfade Duration Milliseconds:</label>
+        <input type="number" id="crossfade-duration-milliseconds" value="8">
+
+        <button id="save-tts-settings">Save Settings</button>
+    </div>
+
     <script src="/static/script.js"></script>
 </body>
+
 </html>

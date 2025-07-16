@@ -13,10 +13,28 @@ document.addEventListener('DOMContentLoaded', () => {
     document.body.insertBefore(messageContainer, document.querySelector('.container'));
     const streamingLog = document.getElementById('streaming-log');
 
+    // TTS Settings elements
+    const textProcessingChunkSizeInput = document.getElementById('text-processing-chunk-size');
+    const audioTokensPerSliceInput = document.getElementById('audio-tokens-per-slice');
+    const removeLeadingMillisecondsInput = document.getElementById('remove-leading-milliseconds');
+    const removeTrailingMillisecondsInput = document.getElementById('remove-trailing-milliseconds');
+    const chunkOverlapStrategySelect = document.getElementById('chunk-overlap-strategy');
+    const crossfadeDurationMillisecondsInput = document.getElementById('crossfade-duration-milliseconds');
+    const saveTtsSettingsButton = document.getElementById('save-tts-settings');
+
     let apiKey = localStorage.getItem('apiKey');
     if (apiKey) {
         apiKeyInput.value = apiKey;
     }
+
+    // Load TTS settings from localStorage
+    const ttsSettings = JSON.parse(localStorage.getItem('ttsSettings')) || {};
+    textProcessingChunkSizeInput.value = ttsSettings.text_processing_chunk_size || 100;
+    audioTokensPerSliceInput.value = ttsSettings.audio_tokens_per_slice || 35;
+    removeLeadingMillisecondsInput.value = ttsSettings.remove_leading_milliseconds || 0;
+    removeTrailingMillisecondsInput.value = ttsSettings.remove_trailing_milliseconds || 0;
+    chunkOverlapStrategySelect.value = ttsSettings.chunk_overlap_strategy || 'full';
+    crossfadeDurationMillisecondsInput.value = ttsSettings.crossfade_duration_milliseconds || 8;
 
     let abortController;
 
@@ -141,6 +159,14 @@ document.addEventListener('DOMContentLoaded', () => {
         url.searchParams.append('voice_id', ttsVoiceSelect.value);
         url.searchParams.append('api_key', apiKey);
 
+        // Append TTS settings to URL
+        url.searchParams.append('text_processing_chunk_size', textProcessingChunkSizeInput.value);
+        url.searchParams.append('audio_tokens_per_slice', audioTokensPerSliceInput.value);
+        url.searchParams.append('remove_leading_milliseconds', removeLeadingMillisecondsInput.value);
+        url.searchParams.append('remove_trailing_milliseconds', removeTrailingMillisecondsInput.value);
+        url.searchParams.append('chunk_overlap_strategy', chunkOverlapStrategySelect.value);
+        url.searchParams.append('crossfade_duration_milliseconds', crossfadeDurationMillisecondsInput.value);
+
         ttsAudio.src = url.toString();
         ttsAudio.play();
 
@@ -167,4 +193,17 @@ document.addEventListener('DOMContentLoaded', () => {
     if (apiKey) {
         loadVoices();
     }
+
+    saveTtsSettingsButton.addEventListener('click', () => {
+        const currentTtsSettings = {
+            text_processing_chunk_size: parseInt(textProcessingChunkSizeInput.value),
+            audio_tokens_per_slice: parseInt(audioTokensPerSliceInput.value),
+            remove_leading_milliseconds: parseInt(removeLeadingMillisecondsInput.value),
+            remove_trailing_milliseconds: parseInt(removeTrailingMillisecondsInput.value),
+            chunk_overlap_strategy: chunkOverlapStrategySelect.value,
+            crossfade_duration_milliseconds: parseInt(crossfadeDurationMillisecondsInput.value)
+        };
+        localStorage.setItem('ttsSettings', JSON.stringify(currentTtsSettings));
+        showMessage('TTS settings saved!', 'success');
+    });
 });

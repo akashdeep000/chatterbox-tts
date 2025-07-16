@@ -80,7 +80,7 @@ class TTSConfig(BaseSettings):
 
     # Text processing and chunking
     TEXT_PROCESSING_CHUNK_SIZE: int = Field(
-        default=100,
+        default=150,
         description="Maximum number of characters per text chunk for processing."
     )
     AUDIO_TOKENS_PER_SLICE: int = Field(
@@ -104,7 +104,7 @@ class TTSConfig(BaseSettings):
         description="Strategy for overlapping audio chunks: 'full' (overlap and crossfade) or 'zero' (no overlap)."
     )
     CROSSFADE_DURATION_MILLISECONDS: int = Field(
-        default=8,
+        default=30,
         description="Duration in milliseconds for crossfading between audio chunks"
     )
 

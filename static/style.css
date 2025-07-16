@@ -60,6 +60,13 @@ input, textarea, select, button {
     box-sizing: border-box;
 }
 
+label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 700;
+    color: var(--primary-color);
+}
+
 textarea {
     resize: vertical;
     min-height: 100px;

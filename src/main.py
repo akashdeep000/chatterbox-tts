@@ -14,7 +14,7 @@ import asyncio
 from .config import settings, tts_config
 from .dependencies import get_tts_engine, get_voice_manager
 from . import dependencies
-from .tts import TextToSpeechEngine, InitializationState
+from .tts_streaming import TextToSpeechEngine, InitializationState
 from .voice_manager import VoiceManager
 from fastapi import File, UploadFile
 
