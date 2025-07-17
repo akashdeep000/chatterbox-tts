@@ -658,8 +658,8 @@ class TextToSpeechEngine:
             text_chunk_count=len(text_chunks),
         )
 
-        speech_token_queue = asyncio.Queue(maxsize=10)
-        pcm_chunk_queue = asyncio.Queue(maxsize=10)
+        speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
+        pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
 
         producer_task = loop.create_task(
             self._t3_producer_task(text_chunks, speech_token_queue, params, self.t3_stream)
