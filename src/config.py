@@ -110,7 +110,7 @@ class TTSConfig(BaseSettings):
 
     # Queue sizes for streaming
     SPEECH_TOKEN_QUEUE_MAX_SIZE: int = Field(
-        default=20,
+        default=5,
         description="Maximum size of the speech token queue used in streaming."
     )
     PCM_CHUNK_QUEUE_MAX_SIZE: int = Field(

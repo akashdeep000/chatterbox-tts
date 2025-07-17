@@ -1,6 +1,4 @@
-# Stage 1: Production Environment
-# Use a single-stage build with the runtime image
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
@@ -32,6 +30,10 @@ WORKDIR /app
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
+# Install PyTorch with CUDA support
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
@@ -49,6 +51,10 @@ RUN python3 scripts/download_models.py
 
 # Set environment variables
 ENV MODEL_PATH="/app/models"
+
+# NVIDIA/CUDA environment variables
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Expose the application port
 EXPOSE 8000

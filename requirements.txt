@@ -2,8 +2,9 @@ fastapi
 uvicorn
 pydantic
 pydantic-settings
-torch
-torchaudio
+# PyTorch with CPU support (ensure CPU compatibility)
+torch>=2.0.0,<2.7.0
+torchaudio>=2.0.0,<2.7.0
 python-dotenv
 git+https://github.com/akashdeep000/chatterbox.git
 python-multipart
