@@ -108,6 +108,16 @@ class TTSConfig(BaseSettings):
         description="Duration in milliseconds for crossfading between audio chunks"
     )
 
+    # Queue sizes for streaming
+    SPEECH_TOKEN_QUEUE_MAX_SIZE: int = Field(
+        default=20,
+        description="Maximum size of the speech token queue used in streaming."
+    )
+    PCM_CHUNK_QUEUE_MAX_SIZE: int = Field(
+        default=10,
+        description="Maximum size of the PCM chunk queue used in streaming."
+    )
+
 # Instantiate the config objects to be used across the application
 settings = AppConfig()
 tts_config = TTSConfig()
