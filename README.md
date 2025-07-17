@@ -54,9 +54,33 @@ To run this project, you will need:
 
 Before running the application, you must configure the following environment variables. You can set them directly in your shell or create a `.env` file in the project root.
 
+### Application Configuration Parameters
+
+These parameters are for the overall application settings.
+
+*   `HOST`: The host address for the application server. Defaults to `0.0.0.0`.
+*   `PORT`: The port for the application server. Defaults to `8000`.
+*   `DEBUG`: Enable or disable debug mode for the application. Defaults to `False`.
+*   `LOG_LEVEL`: The logging level (e.g., `INFO`, `DEBUG`, `WARNING`, `ERROR`). Defaults to `INFO`.
+*   `VOICES_DIR`: Directory where custom voices are stored. Defaults to `voices/`.
+*   `PRELOADED_VOICES_DIR`: Directory for preloaded voices. Defaults to `preloaded-voices/`.
+*   `MODEL_PATH`: Path to the directory containing TTS models. Defaults to `models`.
 *   `API_KEY`: **(Required)** Your secret API key for securing the service.
 *   `CORS_ORIGINS`: A comma-separated list of allowed origins (e.g., `"http://localhost:3000,https://your-frontend.com"`). Defaults to `*` (all origins).
-*   `LOG_LEVEL`: The logging level (e.g., `INFO`, `DEBUG`). Defaults to `INFO`.
+
+### TTS Configuration Parameters
+
+These parameters control the Text-to-Speech engine's behavior and can be set via environment variables prefixed with `TTS_`.
+
+*   `TTS_VOICE_EXAGGERATION_FACTOR`: Controls the voice_exaggeration_factor of the voice. Higher values increase expressiveness. Defaults to `0.5`.
+*   `TTS_CFG_GUIDANCE_WEIGHT`: Classifier-free guidance weight. Influences how strongly the model adheres to the text prompt. Defaults to `0.5`.
+*   `TTS_SYNTHESIS_TEMPERATURE`: synthesis_temperature for text-to-speech synthesis. Higher values lead to more varied but potentially less coherent output. Defaults to `0.8`.
+*   `TTS_TEXT_PROCESSING_CHUNK_SIZE`: Maximum number of characters per text chunk for processing. Defaults to `100`.
+*   `TTS_AUDIO_TOKENS_PER_SLICE`: Number of audio tokens per slice during streaming synthesis. Defaults to `35`.
+*   `TTS_REMOVE_LEADING_MILLISECONDS`: Duration in milliseconds to remove from the start of generated audio. Defaults to `0`.
+*   `TTS_REMOVE_TRAILING_MILLISECONDS`: Duration in milliseconds to remove from the end of generated audio. Defaults to `0`.
+*   `TTS_CHUNK_OVERLAP_STRATEGY`: Strategy for overlapping audio chunks: `"full"` (overlap and crossfade) or `"zero"` (no overlap). Defaults to `"full"`.
+*   `TTS_CROSSFADE_DURATION_MILLISECONDS`: Duration in milliseconds for crossfading between audio chunks. Defaults to `8`.
 
 ### Example `.env` file:
 
@@ -64,6 +88,12 @@ Before running the application, you must configure the following environment var
 API_KEY="your-super-secret-api-key"
 CORS_ORIGINS="http://localhost:3000,https://your-app.com"
 LOG_LEVEL="DEBUG"
+
+# TTS Configuration
+TTS_VOICE_EXAGGERATION_FACTOR=0.7
+TTS_SYNTHESIS_TEMPERATURE=0.9
+TTS_CHUNK_OVERLAP_STRATEGY="zero"
+TTS_CROSSFADE_DURATION_MILLISECONDS=10
 ```
 
 ## Setup and Deployment
@@ -166,12 +196,92 @@ This method is ideal for use in web browsers, as it allows you to set the endpoi
 
 **Example with `curl`:**
 ```bash
-curl -X GET "http://localhost:8000/tts/generate?text=Hello%20world&voice_id=your_voice.wav&api_key=<YOUR_API_KEY>" --output output.wav
+curl -X GET "http://localhost:8000/tts/generate?text=Hello%20world&voice_id=your_voice.wav&api_key=<YOUR_API_KEY>&format=mp3" --output output.mp3
 ```
 
 **Example in HTML:**
 ```html
-<audio controls src="http://localhost:8000/tts/generate?text=Hello%20world&api_key=<YOUR_API_KEY>"></audio>
+<audio controls src="http://localhost:8000/tts/generate?text=Hello%20world&api_key=<YOUR_API_KEY>&format=mp3"></audio>
+```
+
+#### Advanced Usage: Streaming with Media Source Extensions (MSE)
+
+For the lowest latency playback in web applications, you can use the [Media Source Extensions (MSE) API](https://developer.mozilla.org/en-US/docs/Web/API/Media_Source_Extensions_API) to handle the incoming audio stream. This approach gives you fine-grained control over buffering and playback.
+
+The `fmp4` (Fragmented MP4) format is recommended for use with MSE.
+
+**Example with MSE:**
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MSE Streaming Example</title>
+</head>
+<body>
+    <h1>Real-time TTS Streaming with MSE</h1>
+    <audio id="audioPlayer" controls></audio>
+    <br>
+    <input type="text" id="textInput" value="Hello from the world of real-time audio streaming.">
+    <button id="playButton">Play</button>
+
+    <script>
+        const audioPlayer = document.getElementById('audioPlayer');
+        const textInput = document.getElementById('textInput');
+        const playButton = document.getElementById('playButton');
+        const apiKey = 'YOUR_API_KEY'; // Replace with your actual API key
+
+        playButton.addEventListener('click', async () => {
+            const text = encodeURIComponent(textInput.value);
+            const url = `http://localhost:8000/tts/generate?text=${text}&api_key=${apiKey}&format=fmp4`;
+
+            if (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"')) {
+                const mediaSource = new MediaSource();
+                audioPlayer.src = URL.createObjectURL(mediaSource);
+
+                mediaSource.addEventListener('sourceopen', () => {
+                    const sourceBuffer = mediaSource.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+
+                    fetch(url)
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error(`HTTP error! status: ${response.status}`);
+                            }
+                            const reader = response.body.getReader();
+
+                            function push() {
+                                reader.read().then(({ done, value }) => {
+                                    if (done) {
+                                        if (!mediaSource.ended) {
+                                           mediaSource.endOfStream();
+                                        }
+                                        return;
+                                    }
+                                    sourceBuffer.appendBuffer(value);
+                                    push();
+                                }).catch(err => {
+                                    console.error('Error reading stream:', err);
+                                });
+                            }
+
+                            sourceBuffer.addEventListener('updateend', push, { once: true });
+                            push();
+                        })
+                        .catch(e => console.error('Fetch error:', e));
+                });
+
+                audioPlayer.play();
+            } else {
+                console.error("MSE or the required codec is not supported.");
+                // Fallback for browsers that don't support MSE
+                audioPlayer.src = url;
+                audioPlayer.play();
+            }
+        });
+    </script>
+</body>
+</html>
 ```
 
 #### TTS Parameters
@@ -182,15 +292,15 @@ The `/tts/generate` endpoint accepts several parameters to customize the audio g
 | --------------------------- | ------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `text`                      | string  | **(Required)**     | The text to be converted to speech.                                                                                                    |
 | `voice_id`                  | string  | `None`             | The ID of the custom voice to use (e.g., `your_voice.wav`). If not provided, a default voice is used.                                    |
-| `exaggeration`              | float   | `0.5`              | Controls the emotional expressiveness of the speech. Higher values produce more exaggerated speech.                                    |
-| `cfg_weight`                | float   | `0.5`              | Classifier-Free Guidance weight. Higher values make the speech more closely follow the text, but can reduce naturalness.               |
-| `temperature`               | float   | `0.8`              | Controls the randomness of the output. Higher values produce more varied and creative speech, while lower values are more deterministic. |
-| `text_chunk_size`           | integer | `100`              | The number of characters to process in each text chunk. Smaller values can reduce latency but may affect prosody.                      |
-| `tokens_per_slice`          | integer | `35`               | The number of audio tokens to generate in each slice. This affects the granularity of the streaming output.                            |
-| `remove_milliseconds`       | integer | `0`                | The number of milliseconds to trim from the end of the final audio chunk. Useful for removing trailing silence.                        |
-| `remove_milliseconds_start` | integer | `0`                | The number of milliseconds to trim from the beginning of the first audio chunk.                                                        |
-| `chunk_overlap_method`      | string  | `"full"`           | The method for handling overlapping audio chunks. Can be `"full"` or `"zero"`.                                                         |
-| `crossfade_duration`        | float   | `0.008` (internal) | The duration of the crossfade between audio chunks in seconds. This is an internal parameter and not directly exposed via the API.     |
+| `format`                    | string  | `wav`              | The desired audio format. Supported values: `wav`, `mp3`, `fmp4`, `raw_pcm`, `webm`. Overrides the `Accept` header.                        |
+| `cfg_guidance_weight`                | float   | `TTS_CFG_GUIDANCE_WEIGHT`       | Classifier-Free Guidance weight. Higher values make the speech more closely follow the text, but can reduce naturalness.               |
+| `synthesis_temperature`               | float   | `TTS_SYNTHESIS_TEMPERATURE`     | Controls the randomness of the output. Higher values produce more varied and creative speech, while lower values are more deterministic. |
+| `text_processing_chunk_size`           | integer | `TTS_TEXT_PROCESSING_CHUNK_SIZE`| The number of characters to process in each text chunk. Smaller values can reduce latency but may affect prosody.                      |
+| `audio_tokens_per_slice`          | integer | `TTS_AUDIO_TOKENS_PER_SLICE`    | The number of audio tokens to generate in each slice. This affects the granularity of the streaming output.                            |
+| `remove_trailing_milliseconds`       | integer | `TTS_REMOVE_TRAILING_MILLISECONDS`| The number of milliseconds to trim from the end of the final audio chunk.                        |
+| `remove_leading_milliseconds` | integer | `TTS_REMOVE_LEADING_MILLISECONDS`| The number of milliseconds to trim from the beginning of the first audio chunk.                                                        |
+| `chunk_overlap_method`      | string  | `TTS_CHUNK_OVERLAP_STRATEGY`    | The method for handling overlapping audio chunks. Can be `"full"` or `"zero"`.                                                         |
+| `crossfade_duration_milliseconds`        | integer   | `TTS_CROSSFADE_DURATION_MILLISECONDS`| The duration of the crossfade between audio chunks in milliseconds.
 
 ### Performance Optimizations
 
@@ -198,19 +308,21 @@ The TTS engine is optimized for real-time performance through several mechanisms
 
 #### Parameter Tuning for Quality and Speed
 
-The `text_chunk_size`, `tokens_per_slice`, and `chunk_overlap_method` parameters are crucial for balancing audio quality and streaming latency. Understanding how they work together allows you to fine-tune the TTS engine for your specific needs.
+The `text_processing_chunk_size`, `audio_tokens_per_slice`, and `chunk_overlap_method` parameters are crucial for balancing audio quality and streaming latency. Understanding how they work together allows you to fine-tune the TTS engine for your specific needs.
 
-*   **`text_chunk_size`**: This parameter determines how the input text is split into smaller pieces. The T3 model processes one chunk at a time.
+*   **`text_processing_chunk_size`**: This parameter determines how the input text is split into smaller pieces. The T3 model processes one chunk at a time.
     *   **Smaller values** (e.g., 50) lead to lower "time to first audio" because the first chunk is processed faster. However, this can sometimes result in less natural prosody, as the model has less context.
     *   **Larger values** (e.g., 200) provide more context to the model, which can improve the naturalness of the speech, but it will take longer to receive the first audio chunk.
 
-*   **`tokens_per_slice`**: After the T3 model converts a text chunk into a sequence of speech tokens, this parameter determines how many of those tokens are sent to the S3Gen model at a time to be converted into audio.
+*   **`audio_tokens_per_slice`**: After the T3 model converts a text chunk into a sequence of speech tokens, this parameter determines how many of those tokens are sent to the S3Gen model at a time to be converted into audio.
     *   **Smaller values** (e.g., 20) result in smaller, more frequent audio chunks being streamed to the client, which can create a smoother streaming experience.
     *   **Larger values** (e.g., 50) will result in fewer, larger audio chunks, which can be more efficient but may feel less "real-time."
 
 *   **`chunk_overlap_method`**: This parameter defines how the audio from different text chunks is stitched together.
     *   **`"full"`**: This method creates a seamless overlap between audio chunks, which generally produces the highest quality audio by avoiding clicks or pauses. It is slightly more computationally intensive.
     *   **`"zero"`**: This method simply concatenates the audio chunks. It is faster but may occasionally produce audible artifacts at the seams between chunks.
+
+*   **`crossfade_duration_milliseconds`**: This parameter determines the duration of the crossfade between audio chunks.
 
 The following diagram illustrates how these parameters relate to each other in the TTS process:
 
@@ -220,7 +332,7 @@ graph TD
         A["The quick brown fox jumps over the lazy dog."]
     end
 
-    subgraph "Text Chunking (text_chunk_size)"
+    subgraph "Text Chunking (text_processing_chunk_size)"
         B["The quick brown fox..."]
         C["...jumps over the lazy dog."]
     end
@@ -230,7 +342,7 @@ graph TD
         E["[Speech Tokens for Chunk 2]"]
     end
 
-    subgraph "Token Slicing (tokens_per_slice)"
+    subgraph "Token Slicing (audio_tokens_per_slice)"
         F["Slice 1.1"]
         G["Slice 1.2"]
         H["Slice 2.1"]
@@ -248,11 +360,11 @@ graph TD
         N["Final Audio Stream"]
     end
 
-    A -- "split by text_chunk_size" --> B & C
+    A -- "split by text_processing_chunk_size" --> B & C
     B --> D
     C --> E
-    D -- "split by tokens_per_slice" --> F & G
-    E -- "split by tokens_per_slice" --> H & I
+    D -- "split by audio_tokens_per_slice" --> F & G
+    E -- "split by audio_tokens_per_slice" --> H & I
     F --> J
     G --> K
     H --> L

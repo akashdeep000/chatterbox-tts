@@ -2,7 +2,7 @@
 Manages application-wide dependencies, including the singleton TTS engine instance.
 """
 from typing import Optional
-from .tts import TextToSpeechEngine
+from .tts_streaming import TextToSpeechEngine
 from .voice_manager import VoiceManager
 
 # Global singleton instances

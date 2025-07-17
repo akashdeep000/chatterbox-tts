@@ -14,7 +14,7 @@ import asyncio
 from .config import settings, tts_config
 from .dependencies import get_tts_engine, get_voice_manager
 from . import dependencies
-from .tts import TextToSpeechEngine
+from .tts_streaming import TextToSpeechEngine, InitializationState
 from .voice_manager import VoiceManager
 from fastapi import File, UploadFile
 
@@ -32,6 +32,7 @@ async def startup_event():
     logger.info("Initializing TTS engine and Voice Manager...")
     dependencies.tts_engine = TextToSpeechEngine()
     dependencies.voice_manager = VoiceManager()
+    await dependencies.tts_engine.ainit() # Call the async initialization method
     logger.info("TTS engine and Voice Manager initialized successfully.")
 
     # Warm up voice cache for all available voices
@@ -76,6 +77,10 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     duration = time.time() - start_time
     logger.info(f"Handled request: {request.method} {request.url.path} - Status: {response.status_code} - Duration: {duration:.4f}s")
+    if request.url.path.startswith("/static"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     return response
 
 
@@ -87,9 +92,20 @@ async def read_root():
 @app.get("/health")
 async def health_check():
     """
-    Health check endpoint to verify the application is running.
+    Health check endpoint to verify the application is running and TTS engine status.
     """
-    return {"status": "ok"}
+    tts_status = {"status": "ok"}
+    if dependencies.tts_engine:
+        tts_status = dependencies.tts_engine.get_initialization_status()
+        if tts_status["state"] == InitializationState.ERROR.value:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"TTS Engine Error: {tts_status['error']}")
+        elif tts_status["state"] != InitializationState.READY.value:
+            return JSONResponse(content={"status": "initializing", "tts_engine": tts_status}, status_code=status.HTTP_202_ACCEPTED)
+    else:
+        tts_status = {"state": InitializationState.NOT_STARTED.value, "progress": "TTS engine not yet instantiated", "error": None}
+        return JSONResponse(content={"status": "not_started", "tts_engine": tts_status}, status_code=status.HTTP_202_ACCEPTED)
+
+    return {"status": "ok", "tts_engine": tts_status}
 
 # --- Security ---
 api_key_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -114,14 +130,51 @@ async def get_api_key(
 class TTSRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
-    exaggeration: float = tts_config.exaggeration
-    cfg_weight: float = tts_config.cfg_weight
-    temperature: float = tts_config.temperature
-    text_chunk_size: Optional[int] = tts_config.text_chunk_size
-    tokens_per_slice: Optional[int] = tts_config.tokens_per_slice
-    remove_milliseconds: int = tts_config.remove_milliseconds
-    remove_milliseconds_start: int = tts_config.remove_milliseconds_start
-    chunk_overlap_method: str = tts_config.chunk_overlap_method
+    format: Optional[str] = None
+    # voice_exaggeration_factor: float = tts_config.VOICE_EXAGGERATION_FACTOR # can't use this for efficient caching
+    cfg_guidance_weight: float = tts_config.CFG_GUIDANCE_WEIGHT
+    synthesis_temperature: float = tts_config.SYNTHESIS_TEMPERATURE
+    text_processing_chunk_size: Optional[int] = tts_config.TEXT_PROCESSING_CHUNK_SIZE
+    audio_tokens_per_slice: Optional[int] = tts_config.AUDIO_TOKENS_PER_SLICE
+    remove_trailing_milliseconds: int = tts_config.REMOVE_TRAILING_MILLISECONDS
+    remove_leading_milliseconds: int = tts_config.REMOVE_LEADING_MILLISECONDS
+    chunk_overlap_strategy: str = tts_config.CHUNK_OVERLAP_STRATEGY
+    crossfade_duration_milliseconds: int = tts_config.CROSSFADE_DURATION_MILLISECONDS
+
+def get_output_format_and_media_type(
+    accept_header: Optional[str],
+    request_format: Optional[str] = None
+) -> (str, str):
+    """
+    Determines the output format and media type, prioritizing the request_format
+    parameter over the Accept header.
+    """
+    format_map = {
+        "mp3": "audio/mpeg",
+        "fmp4": "audio/mp4",
+        "raw_pcm": "audio/pcm",
+        "webm": "audio/webm",
+        "wav": "audio/wav"
+    }
+
+    # Prioritize the format from the request parameter
+    if request_format and request_format in format_map:
+        return request_format, format_map[request_format]
+
+    # Fallback to Accept header
+    if accept_header:
+        if "audio/mpeg" in accept_header:
+            return "mp3", "audio/mpeg"
+        if "video/mp4" in accept_header or "audio/mp4" in accept_header:
+            return "fmp4", "audio/mp4"
+        if "audio/pcm" in accept_header:
+            return "raw_pcm", "audio/pcm"
+        if "audio/webm" in accept_header:
+            return "webm", "audio/webm"
+
+    # Default to wav
+    return "wav", "audio/wav"
+
 
 @app.api_route("/tts/generate", methods=["GET", "POST"], dependencies=[Depends(get_api_key)])
 async def tts_generate(
@@ -143,36 +196,41 @@ async def tts_generate(
         tts_request = TTSRequest(
             text=query_params.get("text"),
             voice_id=query_params.get("voice_id"),
-            exaggeration=float(query_params.get("exaggeration", tts_config.exaggeration)),
-            cfg_weight=float(query_params.get("cfg_weight", tts_config.cfg_weight)),
-            temperature=float(query_params.get("temperature", tts_config.temperature)),
-            text_chunk_size=int(query_params.get("text_chunk_size", tts_config.text_chunk_size)),
-            tokens_per_slice=int(query_params.get("tokens_per_slice", tts_config.tokens_per_slice)),
-            remove_milliseconds=int(query_params.get("remove_milliseconds", tts_config.remove_milliseconds)),
-            remove_milliseconds_start=int(query_params.get("remove_milliseconds_start", tts_config.remove_milliseconds_start)),
-            chunk_overlap_method=query_params.get("chunk_overlap_method", tts_config.chunk_overlap_method),
+            format=query_params.get("format"),
+            cfg_guidance_weight=float(query_params.get("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT)),
+            synthesis_temperature=float(query_params.get("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE)),
+            text_processing_chunk_size=int(query_params.get("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE)),
+            audio_tokens_per_slice=int(query_params.get("audio_tokens_per_slice", tts_config.AUDIO_TOKENS_PER_SLICE)),
+            remove_trailing_milliseconds=int(query_params.get("remove_trailing_milliseconds", tts_config.REMOVE_TRAILING_MILLISECONDS)),
+            remove_leading_milliseconds=int(query_params.get("remove_leading_milliseconds", tts_config.REMOVE_LEADING_MILLISECONDS)),
+            chunk_overlap_strategy=query_params.get("chunk_overlap_strategy", tts_config.CHUNK_OVERLAP_STRATEGY),
+            crossfade_duration_milliseconds=int(query_params.get("crossfade_duration_milliseconds", tts_config.CROSSFADE_DURATION_MILLISECONDS)),
         )
 
     if not tts_request.text:
         return JSONResponse(content={"error": "Text is required"}, status_code=400)
 
+    accept_header = request.headers.get("Accept")
+    output_format, media_type = get_output_format_and_media_type(accept_header, tts_request.format)
+
     try:
-        logger.info(f"Received TTS request for voice_id: {tts_request.voice_id}")
+        logger.info(f"Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format})")
         start_time = time.time()
         audio_stream = tts_engine.stream(
             text=tts_request.text,
+            output_format=output_format,
             voice_id=tts_request.voice_id,
-            exaggeration=tts_request.exaggeration,
-            cfg_weight=tts_request.cfg_weight,
-            temperature=tts_request.temperature,
-            text_chunk_size=tts_request.text_chunk_size,
-            tokens_per_slice=tts_request.tokens_per_slice,
-            remove_milliseconds=tts_request.remove_milliseconds,
-            remove_milliseconds_start=tts_request.remove_milliseconds_start,
-            chunk_overlap_method=tts_request.chunk_overlap_method,
+            cfg_guidance_weight=tts_request.cfg_guidance_weight,
+            synthesis_temperature=tts_request.synthesis_temperature,
+            text_processing_chunk_size=tts_request.text_processing_chunk_size,
+            audio_tokens_per_slice=tts_request.audio_tokens_per_slice,
+            remove_trailing_milliseconds=tts_request.remove_trailing_milliseconds,
+            remove_leading_milliseconds=tts_request.remove_leading_milliseconds,
+            chunk_overlap_strategy=tts_request.chunk_overlap_strategy,
+            crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
             start_time=start_time
         )
-        return StreamingResponse(audio_stream, media_type="audio/wav")
+        return StreamingResponse(audio_stream, media_type=media_type)
     except Exception as e:
         logger.error(f"TTS generation failed: {e}", exc_info=True)
         return JSONResponse(content={"error": "Internal server error"}, status_code=500)

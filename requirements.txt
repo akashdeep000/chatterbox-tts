@@ -5,7 +5,8 @@ pydantic-settings
 torch
 torchaudio
 python-dotenv
-chatterbox-tts
+git+https://github.com/akashdeep000/chatterbox.git
 python-multipart
 loguru
 pysbd
+ffmpeg-python
