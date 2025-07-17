@@ -19,6 +19,10 @@ class AppConfig(BaseSettings):
         default=False,
         description="Enable debug mode for the application server."
     )
+    WORKERS_COUNT: int = Field(
+        default=1,
+        description="Number of worker processes for the application server. Defaults to 1."
+    )
     # Logging configuration
     LOG_LEVEL: str = Field(
         default="INFO",
@@ -110,12 +114,12 @@ class TTSConfig(BaseSettings):
 
     # Queue sizes for streaming
     SPEECH_TOKEN_QUEUE_MAX_SIZE: int = Field(
-        default=5,
-        description="Maximum size of the speech token queue used in streaming."
+        default=2,
+        description="Maximum size of the speech token queue used in streaming. Smaller values reduce initial latency."
     )
     PCM_CHUNK_QUEUE_MAX_SIZE: int = Field(
-        default=10,
-        description="Maximum size of the PCM chunk queue used in streaming."
+        default=3,
+        description="Maximum size of the PCM chunk queue used in streaming. Smaller values reduce initial latency but may increase risk of stuttering."
     )
 
 # Instantiate the config objects to be used across the application

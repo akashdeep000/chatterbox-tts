@@ -287,4 +287,75 @@ document.addEventListener('DOMContentLoaded', () => {
         localStorage.setItem('ttsSettings', JSON.stringify(currentTtsSettings));
         showMessage('TTS settings saved!', 'success');
     });
+
+    // --- System Status ---
+    const cpuUtilBar = document.getElementById('cpu-util-bar');
+    const cpuUtilText = document.getElementById('cpu-util-text');
+    const ramUsageBar = document.getElementById('ram-usage-bar');
+    const ramUsageText = document.getElementById('ram-usage-text');
+    const gpuUtilBar = document.getElementById('gpu-util-bar');
+    const gpuUtilText = document.getElementById('gpu-util-text');
+    const vramUsageBar = document.getElementById('vram-usage-bar');
+    const vramUsageText = document.getElementById('vram-usage-text');
+    const statusError = document.getElementById('status-error');
+
+    async function updateSystemStatus() {
+        if (!apiKey) {
+            statusError.textContent = 'API Key not set. Cannot fetch status.';
+            return;
+        }
+        try {
+            const response = await fetch(`${baseUrl}/system-status`, {
+                headers: { 'X-API-Key': apiKey }
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`Failed to fetch status: ${errorData.detail || response.statusText}`);
+            }
+
+            const data = await response.json();
+            statusError.textContent = ''; // Clear previous errors
+
+            // Update CPU
+            if (data.cpu && !data.cpu.error) {
+                const cpuPercent = data.cpu.utilization_percent;
+                cpuUtilBar.style.width = `${cpuPercent}%`;
+                cpuUtilText.textContent = `${cpuPercent.toFixed(1)}%`;
+
+                const ramPercent = data.cpu.ram_gb.percent_used;
+                ramUsageBar.style.width = `${ramPercent}%`;
+                ramUsageText.textContent = `${data.cpu.ram_gb.used} / ${data.cpu.ram_gb.total} GB (${ramPercent}%)`;
+            } else {
+                statusError.textContent = `CPU/RAM Error: ${data.cpu.error}`;
+            }
+
+            // Update GPU
+            if (data.gpu && !data.gpu.error) {
+                const gpuPercent = data.gpu.utilization_percent.gpu;
+                gpuUtilBar.style.width = `${gpuPercent}%`;
+                gpuUtilText.textContent = `${gpuPercent}%`;
+
+                const vramTotal = data.gpu.memory_gb.total;
+                const vramUsed = data.gpu.memory_gb.used;
+                const vramPercent = vramTotal > 0 ? (vramUsed / vramTotal) * 100 : 0;
+                vramUsageBar.style.width = `${vramPercent}%`;
+                vramUsageText.textContent = `${vramUsed} / ${vramTotal} GB (${vramPercent.toFixed(1)}%)`;
+            } else {
+                // Don't overwrite CPU error if GPU is also unavailable
+                if (!statusError.textContent) {
+                    statusError.textContent = `GPU Error: ${data.gpu.error || data.gpu.reason}`;
+                }
+            }
+
+        } catch (error) {
+            console.error('Error fetching system status:', error);
+            statusError.textContent = error.message;
+        }
+    }
+
+    if (apiKey) {
+        setInterval(updateSystemStatus, 2000); // Update every 2 seconds
+        updateSystemStatus(); // Initial call
+    }
 });

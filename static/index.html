@@ -31,6 +31,44 @@
     </div>
 
     <div class="container">
+        <h2>System Status</h2>
+        <div class="status-grid">
+            <!-- CPU Status -->
+            <div class="status-item">
+                <label>CPU Utilization:</label>
+                <div class="progress-bar-container">
+                    <div id="cpu-util-bar" class="progress-bar"></div>
+                </div>
+                <span id="cpu-util-text">...</span>
+            </div>
+            <div class="status-item">
+                <label>RAM Usage:</label>
+                <div class="progress-bar-container">
+                    <div id="ram-usage-bar" class="progress-bar"></div>
+                </div>
+                <span id="ram-usage-text">...</span>
+            </div>
+
+            <!-- GPU Status -->
+            <div class="status-item">
+                <label>GPU Utilization:</label>
+                <div class="progress-bar-container">
+                    <div id="gpu-util-bar" class="progress-bar gpu"></div>
+                </div>
+                <span id="gpu-util-text">...</span>
+            </div>
+            <div class="status-item">
+                <label>VRAM Usage:</label>
+                <div class="progress-bar-container">
+                    <div id="vram-usage-bar" class="progress-bar gpu"></div>
+                </div>
+                <span id="vram-usage-text">...</span>
+            </div>
+        </div>
+        <div id="status-error" class="error-message"></div>
+    </div>
+
+    <div class="container">
         <h2>Text-to-Speech</h2>
         <textarea id="tts-text" placeholder="Enter text to synthesize"></textarea>
         <select id="tts-voice"></select>

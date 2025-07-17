@@ -1,20 +1,21 @@
 import uvicorn
 from src.config import settings
+import os
 
 if __name__ == "__main__":
-    """
-    This script provides a convenient way to run the application for local development.
+    # Get worker count from settings. Default is 1.
+    workers_count = settings.WORKERS_COUNT
 
-    It launches the Uvicorn server with the correct application path and enables --reload,
-    which automatically restarts the server when code changes are detected.
+    # In debug mode, Uvicorn requires workers=1 to use the --reload flag.
+    if settings.DEBUG:
+        workers_count = 1
 
-    To run the application, execute this command from the project root:
-    python run.py
-    """
     uvicorn.run(
-        "src.main:app",
+        "src.main:create_app",  # Point to the factory function
+        factory=True,           # Tell Uvicorn to use the factory
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
+        workers=workers_count,
         log_level=settings.LOG_LEVEL.lower()
     )
