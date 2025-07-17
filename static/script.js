@@ -36,12 +36,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Load TTS settings from localStorage
     const ttsSettings = JSON.parse(localStorage.getItem('ttsSettings')) || {};
-    textProcessingChunkSizeInput.value = ttsSettings.text_processing_chunk_size || 100;
+    textProcessingChunkSizeInput.value = ttsSettings.text_processing_chunk_size || 150;
     audioTokensPerSliceInput.value = ttsSettings.audio_tokens_per_slice || 35;
     removeLeadingMillisecondsInput.value = ttsSettings.remove_leading_milliseconds || 0;
     removeTrailingMillisecondsInput.value = ttsSettings.remove_trailing_milliseconds || 0;
     chunkOverlapStrategySelect.value = ttsSettings.chunk_overlap_strategy || 'full';
-    crossfadeDurationMillisecondsInput.value = ttsSettings.crossfade_duration_milliseconds || 8;
+    crossfadeDurationMillisecondsInput.value = ttsSettings.crossfade_duration_milliseconds || 30;
 
     let abortController;
 
@@ -171,7 +171,9 @@ document.addEventListener('DOMContentLoaded', () => {
         abortController = new AbortController();
         const signal = abortController.signal;
 
-        const useMse = document.getElementById('format-select').value === 'fmp4';
+        const formatSelect = document.getElementById('format-select');
+        const selectedFormat = formatSelect.value;
+        const useMse = selectedFormat === 'fmp4';
 
         const url = new URL('/tts/generate', baseUrl);
         url.searchParams.append('text', ttsTextInput.value);
@@ -184,12 +186,14 @@ document.addEventListener('DOMContentLoaded', () => {
         url.searchParams.append('remove_trailing_milliseconds', removeTrailingMillisecondsInput.value);
         url.searchParams.append('chunk_overlap_strategy', chunkOverlapStrategySelect.value);
         url.searchParams.append('crossfade_duration_milliseconds', crossfadeDurationMillisecondsInput.value);
+        url.searchParams.append('format', selectedFormat);
 
         const headers = { 'X-API-Key': apiKey };
         if (useMse) {
             headers['Accept'] = 'audio/mp4';
         } else {
-            headers['Accept'] = document.getElementById('format-select').value === 'mp3' ? 'audio/mpeg' : 'audio/wav';
+            // For non-MSE, the browser will set the Accept header,
+            // but the 'format' URL param takes precedence on the server.
         }
 
         if (useMse) {

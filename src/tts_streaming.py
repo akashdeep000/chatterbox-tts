@@ -658,8 +658,8 @@ class TextToSpeechEngine:
             text_chunk_count=len(text_chunks),
         )
 
-        speech_token_queue = asyncio.Queue(maxsize=2)
-        pcm_chunk_queue = asyncio.Queue(maxsize=2)
+        speech_token_queue = asyncio.Queue(maxsize=10)
+        pcm_chunk_queue = asyncio.Queue(maxsize=10)
 
         producer_task = loop.create_task(
             self._t3_producer_task(text_chunks, speech_token_queue, params, self.t3_stream)
@@ -683,7 +683,7 @@ class TextToSpeechEngine:
         try:
             async for encoded_chunk in encoded_stream:
                 yield_count += 1
-                log.info(f"Sending {len(encoded_chunk)} bytes to client (chunk {yield_count})")
+                log.debug(f"Sending {len(encoded_chunk)} bytes to client (chunk {yield_count})")
                 yield encoded_chunk
 
         finally:

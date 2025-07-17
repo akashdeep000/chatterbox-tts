@@ -77,6 +77,10 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     duration = time.time() - start_time
     logger.info(f"Handled request: {request.method} {request.url.path} - Status: {response.status_code} - Duration: {duration:.4f}s")
+    if request.url.path.startswith("/static"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
     return response
 
 
@@ -126,6 +130,7 @@ async def get_api_key(
 class TTSRequest(BaseModel):
     text: str
     voice_id: Optional[str] = None
+    format: Optional[str] = None
     # voice_exaggeration_factor: float = tts_config.VOICE_EXAGGERATION_FACTOR # can't use this for efficient caching
     cfg_guidance_weight: float = tts_config.CFG_GUIDANCE_WEIGHT
     synthesis_temperature: float = tts_config.SYNTHESIS_TEMPERATURE
@@ -136,16 +141,38 @@ class TTSRequest(BaseModel):
     chunk_overlap_strategy: str = tts_config.CHUNK_OVERLAP_STRATEGY
     crossfade_duration_milliseconds: int = tts_config.CROSSFADE_DURATION_MILLISECONDS
 
-def get_output_format_and_media_type(accept_header: Optional[str]) -> (str, str):
-    """Parses the Accept header to determine the output format and media type."""
+def get_output_format_and_media_type(
+    accept_header: Optional[str],
+    request_format: Optional[str] = None
+) -> (str, str):
+    """
+    Determines the output format and media type, prioritizing the request_format
+    parameter over the Accept header.
+    """
+    format_map = {
+        "mp3": "audio/mpeg",
+        "fmp4": "audio/mp4",
+        "raw_pcm": "audio/pcm",
+        "webm": "audio/webm",
+        "wav": "audio/wav"
+    }
+
+    # Prioritize the format from the request parameter
+    if request_format and request_format in format_map:
+        return request_format, format_map[request_format]
+
+    # Fallback to Accept header
     if accept_header:
-        # Simple parsing, can be made more robust
         if "audio/mpeg" in accept_header:
             return "mp3", "audio/mpeg"
         if "video/mp4" in accept_header or "audio/mp4" in accept_header:
             return "fmp4", "audio/mp4"
         if "audio/pcm" in accept_header:
             return "raw_pcm", "audio/pcm"
+        if "audio/webm" in accept_header:
+            return "webm", "audio/webm"
+
+    # Default to wav
     return "wav", "audio/wav"
 
 
@@ -169,6 +196,7 @@ async def tts_generate(
         tts_request = TTSRequest(
             text=query_params.get("text"),
             voice_id=query_params.get("voice_id"),
+            format=query_params.get("format"),
             cfg_guidance_weight=float(query_params.get("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT)),
             synthesis_temperature=float(query_params.get("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE)),
             text_processing_chunk_size=int(query_params.get("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE)),
@@ -183,7 +211,7 @@ async def tts_generate(
         return JSONResponse(content={"error": "Text is required"}, status_code=400)
 
     accept_header = request.headers.get("Accept")
-    output_format, media_type = get_output_format_and_media_type(accept_header)
+    output_format, media_type = get_output_format_and_media_type(accept_header, tts_request.format)
 
     try:
         logger.info(f"Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format})")

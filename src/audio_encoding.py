@@ -43,10 +43,6 @@ class AudioEncoder:
         self.bytes_per_sample = bit_depth // 8
         self.frame_size = self.bytes_per_sample * channels
 
-        # Real-time processing queues
-        self.input_queue = asyncio.Queue(maxsize=1)
-        self.output_queue = asyncio.Queue(maxsize=1)
-
         # Validate format
         self._validate_format()
 
@@ -196,7 +192,7 @@ class AudioEncoder:
             '-b:a', self.kwargs.get('bitrate', '64k'),
             '-f', 'mp4',
             '-movflags', 'frag_keyframe+empty_moov+default_base_moof+dash',
-            '-frag_duration', str(self.kwargs.get('fragment_duration', 100000)),  # 100ms
+            '-frag_duration', str(self.kwargs.get('fragment_duration', 20000)),  # 200ms
             '-flush_packets', '1',
             '-reset_timestamps', '1',
             '-avoid_negative_ts', 'make_zero',

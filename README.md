@@ -196,12 +196,92 @@ This method is ideal for use in web browsers, as it allows you to set the endpoi
 
 **Example with `curl`:**
 ```bash
-curl -X GET "http://localhost:8000/tts/generate?text=Hello%20world&voice_id=your_voice.wav&api_key=<YOUR_API_KEY>" --output output.wav
+curl -X GET "http://localhost:8000/tts/generate?text=Hello%20world&voice_id=your_voice.wav&api_key=<YOUR_API_KEY>&format=mp3" --output output.mp3
 ```
 
 **Example in HTML:**
 ```html
-<audio controls src="http://localhost:8000/tts/generate?text=Hello%20world&api_key=<YOUR_API_KEY>"></audio>
+<audio controls src="http://localhost:8000/tts/generate?text=Hello%20world&api_key=<YOUR_API_KEY>&format=mp3"></audio>
+```
+
+#### Advanced Usage: Streaming with Media Source Extensions (MSE)
+
+For the lowest latency playback in web applications, you can use the [Media Source Extensions (MSE) API](https://developer.mozilla.org/en-US/docs/Web/API/Media_Source_Extensions_API) to handle the incoming audio stream. This approach gives you fine-grained control over buffering and playback.
+
+The `fmp4` (Fragmented MP4) format is recommended for use with MSE.
+
+**Example with MSE:**
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MSE Streaming Example</title>
+</head>
+<body>
+    <h1>Real-time TTS Streaming with MSE</h1>
+    <audio id="audioPlayer" controls></audio>
+    <br>
+    <input type="text" id="textInput" value="Hello from the world of real-time audio streaming.">
+    <button id="playButton">Play</button>
+
+    <script>
+        const audioPlayer = document.getElementById('audioPlayer');
+        const textInput = document.getElementById('textInput');
+        const playButton = document.getElementById('playButton');
+        const apiKey = 'YOUR_API_KEY'; // Replace with your actual API key
+
+        playButton.addEventListener('click', async () => {
+            const text = encodeURIComponent(textInput.value);
+            const url = `http://localhost:8000/tts/generate?text=${text}&api_key=${apiKey}&format=fmp4`;
+
+            if (window.MediaSource && MediaSource.isTypeSupported('audio/mp4; codecs="mp4a.40.2"')) {
+                const mediaSource = new MediaSource();
+                audioPlayer.src = URL.createObjectURL(mediaSource);
+
+                mediaSource.addEventListener('sourceopen', () => {
+                    const sourceBuffer = mediaSource.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+
+                    fetch(url)
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error(`HTTP error! status: ${response.status}`);
+                            }
+                            const reader = response.body.getReader();
+
+                            function push() {
+                                reader.read().then(({ done, value }) => {
+                                    if (done) {
+                                        if (!mediaSource.ended) {
+                                           mediaSource.endOfStream();
+                                        }
+                                        return;
+                                    }
+                                    sourceBuffer.appendBuffer(value);
+                                    push();
+                                }).catch(err => {
+                                    console.error('Error reading stream:', err);
+                                });
+                            }
+
+                            sourceBuffer.addEventListener('updateend', push, { once: true });
+                            push();
+                        })
+                        .catch(e => console.error('Fetch error:', e));
+                });
+
+                audioPlayer.play();
+            } else {
+                console.error("MSE or the required codec is not supported.");
+                // Fallback for browsers that don't support MSE
+                audioPlayer.src = url;
+                audioPlayer.play();
+            }
+        });
+    </script>
+</body>
+</html>
 ```
 
 #### TTS Parameters
@@ -212,7 +292,7 @@ The `/tts/generate` endpoint accepts several parameters to customize the audio g
 | --------------------------- | ------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `text`                      | string  | **(Required)**     | The text to be converted to speech.                                                                                                    |
 | `voice_id`                  | string  | `None`             | The ID of the custom voice to use (e.g., `your_voice.wav`). If not provided, a default voice is used.                                    |
-| `~~voice_exaggeration_factor~~`          | float   | `TTS_VOICE_EXAGGERATION_FACTOR` | Controls the emotional expressiveness of the speech. Higher values produce more exaggerated speech.                                    |
+| `format`                    | string  | `wav`              | The desired audio format. Supported values: `wav`, `mp3`, `fmp4`, `raw_pcm`, `webm`. Overrides the `Accept` header.                        |
 | `cfg_guidance_weight`                | float   | `TTS_CFG_GUIDANCE_WEIGHT`       | Classifier-Free Guidance weight. Higher values make the speech more closely follow the text, but can reduce naturalness.               |
 | `synthesis_temperature`               | float   | `TTS_SYNTHESIS_TEMPERATURE`     | Controls the randomness of the output. Higher values produce more varied and creative speech, while lower values are more deterministic. |
 | `text_processing_chunk_size`           | integer | `TTS_TEXT_PROCESSING_CHUNK_SIZE`| The number of characters to process in each text chunk. Smaller values can reduce latency but may affect prosody.                      |
