@@ -163,8 +163,6 @@ class TextToSpeechEngine:
         Model loading and device setup are handled asynchronously by `ainit`.
         """
         self.device = None # Will be set during async initialization
-        self.t3_stream = None
-        self.s3gen_stream = None
         self.tts = None # Will be loaded during async initialization
         self.voice_manager = VoiceManager()
         self.voice_cache: dict[str, Conditionals] = {}
@@ -196,12 +194,6 @@ class TextToSpeechEngine:
             log.info(f"Initializing Chatterbox TTS model...")
             log.info(f"Device: {self.device}")
             log.info(f"Model path: {settings.MODEL_PATH}")
-
-            self.t3_stream = None
-            self.s3gen_stream = None
-            if self.device == "cuda":
-                self.t3_stream = torch.cuda.Stream()
-                self.s3gen_stream = torch.cuda.Stream()
 
             self._initialization_progress = "Configuring device compatibility..."
             # Patch torch.load for CPU compatibility if needed
@@ -661,11 +653,15 @@ class TextToSpeechEngine:
         speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
         pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
 
+        # Create streams for this specific request
+        t3_stream = torch.cuda.Stream() if self.device == "cuda" else None
+        s3gen_stream = torch.cuda.Stream() if self.device == "cuda" else None
+
         producer_task = loop.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, params, self.t3_stream)
+            self._t3_producer_task(text_chunks, speech_token_queue, params, t3_stream)
         )
         consumer_task = loop.create_task(
-            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, params, self.s3gen_stream)
+            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, params, s3gen_stream)
         )
 
         async def pcm_generator():
