@@ -18,6 +18,7 @@ import time
 import functools
 from enum import Enum
 import random
+import concurrent.futures
 
 from .audio_encoding import AudioEncoder
 
@@ -112,10 +113,10 @@ class _AudioProcessor:
     """Handles audio processing tasks like WAV header creation and PCM conversion."""
 
     @staticmethod
-    async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop) -> bytes:
+    async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop, executor: concurrent.futures.ThreadPoolExecutor) -> bytes:
         """
         Converts an audio tensor to PCM byte data asynchronously to avoid blocking.
-        The tensor is moved to the CPU and converted inside a thread pool executor.
+        The tensor is moved to the CPU and converted inside a dedicated thread pool executor.
         """
         def _blocking_conversion():
             """The synchronous part of the conversion."""
@@ -125,8 +126,8 @@ class _AudioProcessor:
             safe_delete_tensors(audio_tensor, audio_tensor_clamped, audio_tensor_int)
             return pcm_data
 
-        # Offload the blocking CPU operations to a separate thread
-        return await loop.run_in_executor(None, _blocking_conversion)
+        # Offload the blocking CPU operations to the dedicated executor
+        return await loop.run_in_executor(executor, _blocking_conversion)
 
 
 class TextToSpeechEngine:
@@ -155,6 +156,9 @@ class TextToSpeechEngine:
         self._initialization_progress: str = ""
         self._initialization_error: Optional[str] = None
         self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_GPU)
+        self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=settings.CONCURRENT_REQUESTS_PER_GPU
+        )
 
     async def ainit(self):
         """
@@ -312,12 +316,22 @@ class TextToSpeechEngine:
         stream: torch.cuda.Stream,
     ) -> Generator[torch.Tensor, None, None]:
         """Runs the blocking T3 inference and returns a generator for the token stream."""
-        with torch.cuda.stream(stream):
-            # Directly return the generator from tts.t3.inference_stream
+        # Use the CUDA stream context only if a stream is provided (i.e., on a CUDA device)
+        if stream:
+            with torch.cuda.stream(stream):
+                return self.tts.t3.inference_stream(
+                    t3_cond=t3_cond,
+                    text_tokens=text_tokens,
+                    max_new_tokens=1000,
+                    temperature=synthesis_temperature,
+                    cfg_weight=cfg_guidance_weight,
+                )
+        else:
+            # For CPU, run without the stream context
             return self.tts.t3.inference_stream(
                 t3_cond=t3_cond,
                 text_tokens=text_tokens,
-                max_new_tokens=1000, # Consider making this configurable if needed
+                max_new_tokens=1000,
                 temperature=synthesis_temperature,
                 cfg_weight=cfg_guidance_weight,
             )
@@ -327,8 +341,8 @@ class TextToSpeechEngine:
         text_chunks: list,
         speech_token_queue: asyncio.Queue,
         params: SynthesisParams,
-        t3_stream: torch.cuda.Stream,
-        s3gen_stream: torch.cuda.Stream,
+        t3_stream: Optional[torch.cuda.Stream],
+        s3gen_stream: Optional[torch.cuda.Stream],
     ):
         """Producer task for T3 model. Generates speech tokens and puts them into a queue."""
         num_chunks = len(text_chunks)
@@ -355,7 +369,6 @@ class TextToSpeechEngine:
                 # 2. T3 Inference (blocking)
                 log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
                 log.info(f"{log_prefix}[{params.request_id}] T3: Starting inference for chunk {i+1}/{num_chunks}")
-                t3_start_time = time.time()
                 # 3. T3 Inference (non-blocking)
                 sync_token_generator = await loop.run_in_executor(
                     None,
@@ -366,11 +379,9 @@ class TextToSpeechEngine:
                     params.cfg_guidance_weight,
                     t3_stream,
                 )
-                t3_inference_time = time.time() - t3_start_time
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] T3: Inference for chunk {i+1}/{num_chunks} took {t3_inference_time:.4f}s")
 
                 # 4. Stream individual tokens and accumulate into slices before queuing
+                t3_start_time = time.time()
                 current_slice = [] # array of single token [token shape: (B, 1)]
                 slice_idx = 0
 
@@ -398,8 +409,9 @@ class TextToSpeechEngine:
                         slice_idx += 1
                         is_first_slice = (slice_idx == 1)
                         # Record an event on the T3 stream after the slice is produced
-                        event = torch.cuda.Event()
-                        event.record(t3_stream)
+                        event = torch.cuda.Event() if t3_stream else None
+                        if event:
+                            event.record(t3_stream)
 
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, False, is_first_text_chunk, is_last_text_chunk, event)
@@ -411,11 +423,12 @@ class TextToSpeechEngine:
                         # Concatenate all predicted tokens along the sequence dimension.
                         predicted_tokens = torch.cat(current_slice, dim=1)  # shape: (B, num_tokens)
                         # Record an event on the T3 stream for the final slice
-                        event = torch.cuda.Event()
-                        event.record(t3_stream)
+                        event = torch.cuda.Event() if t3_stream else None
+                        if event:
+                            event.record(t3_stream)
 
                         await speech_token_queue.put(
-                            (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk, event) # shape: (B, num_tokens)
+                            (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk, event)
                         )
                         current_slice = [] # Clear current_slice after sending
                         break # All tokens sent for this chunk
@@ -424,8 +437,9 @@ class TextToSpeechEngine:
                     if generator_exhausted and not current_slice:
                         break
 
+                t3_inference_time = time.time() - t3_start_time
                 log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] T3: Finished inference for chunk {i+1}/{num_chunks}, produced {slice_idx} slices.")
+                log.info(f"{log_prefix}[{params.request_id}] T3: Finished inference for chunk {i+1}/{num_chunks}, produced {slice_idx} slices in {t3_inference_time:.4f}s.")
 
         except Exception as e:
             log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
@@ -433,72 +447,59 @@ class TextToSpeechEngine:
         finally:
             await speech_token_queue.put(None) # Signal end of production
 
-    async def _s3gen_consumer_task(
+    async def _s3gen_producer_task(
         self,
         speech_token_queue: asyncio.Queue,
-        pcm_chunk_queue: asyncio.Queue,
+        gpu_audio_queue: asyncio.Queue,
         params: SynthesisParams,
-        s3gen_stream: torch.cuda.Stream,
+        s3gen_stream: Optional[torch.cuda.Stream],
     ):
-        """Consumer task for S3Gen model. Converts speech tokens to audio chunks."""
+        """Producer task for S3Gen model. Converts speech tokens to audio chunks, handling all GPU-side processing."""
         loop = params.loop
-        current_text_chunk_accumulated_tokens = None # Accumulates tokens for the current text chunk
-        cache_source = torch.zeros(1, 1, 0).to(self.device) # Initialize cache_source for S3Gen streaming
+        current_text_chunk_accumulated_tokens = None
+        cache_source = torch.zeros(1, 1, 0).to(self.device)
         last_text_chunk_num = -1
         eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
-        previous_audio_chunk = None  # Stores the remainder of the last processed chunk for the next cross-fade
-        is_first_audio_chunk_sent = False # Flag to track if the very first audio chunk has been sent
-        previous_length = 0 # Tracks audio length for 'full' overlap strategy
+        previous_audio_chunk = None
+        previous_length = 0
 
         try:
             while True:
                 queue_item = await speech_token_queue.get()
                 if queue_item is None:
-                    # End of stream. No more audio to process.
-                    # The last chunk should have already been sent by the main loop.
+                    if previous_audio_chunk is not None and previous_audio_chunk.numel() > 0:
+                        await gpu_audio_queue.put(previous_audio_chunk)
                     break
 
                 token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk, event = queue_item
 
-                # Wait for the T3 slice to be ready before processing with S3Gen
-                s3gen_stream.wait_event(event)
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(
-                    f"{log_prefix}[{params.request_id}] S3Gen: Starting inference for slice {slice_num} "
-                    f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
-                )
-                # Reset state for new text chunks
-                if text_chunk_num != last_text_chunk_num:
-                    current_text_chunk_accumulated_tokens = None # Reset for new text chunk
-                    cache_source = torch.zeros(1, 1, 0).to(self.device) # Reset cache_source for new text chunk
-                    last_text_chunk_num = text_chunk_num
-                    previous_length = 0 # Reset for new text chunk
+                if s3gen_stream and event:
+                    s3gen_stream.wait_event(event)
 
-                # 1. Prepare tokens for S3Gen based on overlap method
+                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
+                log.info(f"{log_prefix}[{params.request_id}] S3Gen: Starting inference for slice {slice_num} (from text chunk {text_chunk_num}/{params.text_chunk_count})")
+
+                if text_chunk_num != last_text_chunk_num:
+                    current_text_chunk_accumulated_tokens = None
+                    cache_source = torch.zeros(1, 1, 0).to(self.device)
+                    last_text_chunk_num = text_chunk_num
+                    previous_length = 0
+
                 if params.chunk_overlap_strategy == "full":
-                    if current_text_chunk_accumulated_tokens is None:
-                        current_text_chunk_accumulated_tokens = token_chunk
-                    else:
-                        current_text_chunk_accumulated_tokens = torch.cat((current_text_chunk_accumulated_tokens, token_chunk), dim=1)
-                    # The speech_tokens for the current inference is the accumulated tokens
+                    current_text_chunk_accumulated_tokens = token_chunk if current_text_chunk_accumulated_tokens is None else torch.cat((current_text_chunk_accumulated_tokens, token_chunk), dim=1)
                     speech_tokens_for_inference = current_text_chunk_accumulated_tokens
-                else:  # zero overlap
+                else:
                     speech_tokens_for_inference = token_chunk
 
+                # 1. Prepare tokens for S3Gen
+                if is_last_slice:
+                    speech_tokens_for_inference = torch.cat([speech_tokens_for_inference, eos_token], dim=1)
 
-                # Apply EOS token only for the last slice of the current text chunk
-                if is_last_slice: # Apply EOS token at the end of each text chunk's last slice
-                    speech_tokens_with_eos = torch.cat([speech_tokens_for_inference, eos_token], dim=1)
-                    speech_tokens_for_inference = speech_tokens_with_eos[0]
-
-                # with token filtering and were not necessary for the current streaming logic.
                 speech_tokens_for_inference = drop_invalid_tokens(speech_tokens_for_inference)
                 speech_tokens_for_inference = speech_tokens_for_inference[speech_tokens_for_inference < 6561]
 
-                # If, after filtering, we have no valid tokens, skip this slice entirely.
                 if speech_tokens_for_inference.shape[-1] == 0:
-                    log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                    log.warning(f"{log_prefix}[{params.request_id}] Skipping a slice because it contained no valid tokens after filtering.")
+                    log.warning(f"[{params.request_id}] Skipping a slice because it contained no valid tokens after filtering.")
                     speech_token_queue.task_done()
                     continue
 
@@ -506,124 +507,94 @@ class TextToSpeechEngine:
                     padding_needed = 3 - speech_tokens_for_inference.shape[-1]
                     speech_tokens_for_inference = F.pad(speech_tokens_for_inference, (0, padding_needed), "constant", 0)
 
-                # 2. S3Gen Inference (blocking)
-                inference_kwargs = {
-                    "speech_tokens": speech_tokens_for_inference,
-                    "ref_dict": params.conds.gen, # Always use the initial ref_dict
-                }
+                # 2. S3Gen Inference
+                inference_kwargs = {"speech_tokens": speech_tokens_for_inference, "ref_dict": params.conds.gen}
                 if params.chunk_overlap_strategy == "full":
-                    inference_kwargs["cache_source"] = cache_source # Pass the cache_source for streaming
+                    inference_kwargs["cache_source"] = cache_source
 
-                partial_inference = functools.partial(
-                    self.tts.s3gen.inference,
-                    **inference_kwargs
-                )
+                partial_inference = functools.partial(self.tts.s3gen.inference, **inference_kwargs)
                 s3gen_start_time = time.time()
                 with torch.cuda.stream(s3gen_stream):
                     wav, new_cache_source = await loop.run_in_executor(None, partial_inference)
                 s3gen_inference_time = time.time() - s3gen_start_time
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
                 log.info(f"{log_prefix}[{params.request_id}] S3Gen: Inference for slice {slice_num} took {s3gen_inference_time:.4f}s")
                 current_audio_chunk = wav.squeeze(0).detach()
 
-                # 3. Post-processing based on overlap method
+                # 3. Overlap Handling
                 if params.chunk_overlap_strategy == "full":
-                    # Update the cache_source for the next iteration
                     cache_source = new_cache_source
-                    # Trim the repeated audio from the beginning of the chunk
                     new_audio_length = current_audio_chunk.shape[0]
                     if not is_first_slice:
                         current_audio_chunk = current_audio_chunk[previous_length:]
                     previous_length = new_audio_length
 
-                # 4. Audio Processing (Trimming, Crossfading)
-                # Calculate samples to remove based on milliseconds
+                # 4. GPU-side Trimming
                 leading_samples_to_remove = (params.remove_leading_milliseconds * self.sr) // 1000
                 trailing_samples_to_remove = (params.remove_trailing_milliseconds * self.sr) // 1000
+                if is_first_text_chunk and is_first_slice and leading_samples_to_remove > 0 and current_audio_chunk.shape[0] > leading_samples_to_remove:
+                    current_audio_chunk = current_audio_chunk[leading_samples_to_remove:]
+                if is_last_text_chunk and is_last_slice and trailing_samples_to_remove > 0 and current_audio_chunk.shape[0] > trailing_samples_to_remove:
+                    current_audio_chunk = current_audio_chunk[:-trailing_samples_to_remove]
+
+                # 5. Cross-fading Logic
                 crossfade_samples = (params.crossfade_duration_milliseconds * self.sr) // 1000
-
-                # --- Trimming Logic ---
-                # Trim leading silence only from the very first chunk of the entire stream
-                if is_first_text_chunk and is_first_slice:
-                    if leading_samples_to_remove > 0 and current_audio_chunk.shape[0] > leading_samples_to_remove:
-                        current_audio_chunk = current_audio_chunk[leading_samples_to_remove:]
-
-                # Trim trailing silence only from the very last chunk of the entire stream
-                if is_last_text_chunk and is_last_slice:
-                    if trailing_samples_to_remove > 0 and current_audio_chunk.shape[0] > trailing_samples_to_remove:
-                        current_audio_chunk = current_audio_chunk[:-trailing_samples_to_remove]
-
-
-                # --- Crossfading Logic ---
                 if previous_audio_chunk is not None and crossfade_samples > 0:
-                    # Ensure we have enough audio data for a crossfade
                     if previous_audio_chunk.shape[0] > crossfade_samples and current_audio_chunk.shape[0] > crossfade_samples:
-                        # Create the fade-out envelope for the previous chunk
-                        fade_out = torch.linspace(1, 0, crossfade_samples).to(self.device)
-                        # Create the fade-in envelope for the current chunk
-                        fade_in = torch.linspace(0, 1, crossfade_samples).to(self.device)
-
-                        # Apply the fade-out to the end of the previous chunk
+                        fade_out = torch.linspace(1, 0, crossfade_samples, device=self.device)
+                        fade_in = torch.linspace(0, 1, crossfade_samples, device=self.device)
                         previous_audio_chunk[-crossfade_samples:] *= fade_out
-                        # Apply the fade-in to the beginning of the current chunk
                         current_audio_chunk[:crossfade_samples] *= fade_in
-
-                        # Overlap and add the crossfaded sections
                         crossfaded_region = previous_audio_chunk[-crossfade_samples:] + current_audio_chunk[:crossfade_samples]
-
-                        # Combine the parts: main part of previous, crossfaded region, main part of current
-                        processed_chunk = torch.cat([
-                            previous_audio_chunk[:-crossfade_samples],
-                            crossfaded_region,
-                            current_audio_chunk[crossfade_samples:]
-                        ])
+                        processed_chunk = torch.cat([previous_audio_chunk[:-crossfade_samples], crossfaded_region, current_audio_chunk[crossfade_samples:]])
                     else:
-                        # If chunks are too short for crossfading, just concatenate them
                         processed_chunk = torch.cat([previous_audio_chunk, current_audio_chunk])
                 else:
                     processed_chunk = current_audio_chunk
 
-
-                # --- Buffering for next crossfade ---
-                # For all but the last slice, save the end of the processed chunk for the next crossfade
+                # 6. Buffering for next cross-fade
                 if not is_last_slice:
                     if processed_chunk.shape[0] > crossfade_samples:
-                        # The part to send immediately is everything except the crossfade tail
                         chunk_to_send = processed_chunk[:-crossfade_samples]
-                        # The part to save for the next iteration is the crossfade tail
                         previous_audio_chunk = processed_chunk[-crossfade_samples:]
                     else:
-                        # If the chunk is shorter than the crossfade duration, send nothing and buffer the whole chunk
                         chunk_to_send = None
                         previous_audio_chunk = processed_chunk
                 else:
-                    # This is the last slice of a text chunk. Send the whole thing.
                     chunk_to_send = processed_chunk
-                    previous_audio_chunk = None # Reset for the next text chunk
+                    previous_audio_chunk = None
 
-
-                # 4. Queue the processed audio chunk for output
-                if chunk_to_send is not None and chunk_to_send.shape[0] > 0:
-                    pcm_data = await self.audio_processor.to_pcm(chunk_to_send, loop)
-                    await pcm_chunk_queue.put(pcm_data)
-                    log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                    log.info(f"{log_prefix}[{params.request_id}] S3Gen: Queued audio chunk of size {len(pcm_data)} bytes.")
+                # 7. Queue the final tensor for PCM conversion
+                if chunk_to_send is not None and chunk_to_send.numel() > 0:
+                    await gpu_audio_queue.put(chunk_to_send)
 
                 speech_token_queue.task_done()
 
-            # After the loop, if there's any remaining audio in previous_audio_chunk, send it.
-            # This happens for the very last chunk of the entire request.
-            if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
-                pcm_data = await self.audio_processor.to_pcm(previous_audio_chunk, loop)
+        except Exception as e:
+            log.error(f"[{params.request_id}] Error in S3Gen producer task: {e}", exc_info=True)
+        finally:
+            await gpu_audio_queue.put(None)
+
+    async def _pcm_consumer_task(
+        self,
+        gpu_audio_queue: asyncio.Queue,
+        pcm_chunk_queue: asyncio.Queue,
+        params: SynthesisParams,
+    ):
+        """Consumes audio tensors from the GPU queue and converts them to PCM data."""
+        loop = params.loop
+        try:
+            while True:
+                audio_tensor = await gpu_audio_queue.get()
+                if audio_tensor is None:
+                    break
+
+                pcm_data = await self.audio_processor.to_pcm(audio_tensor, loop, self.pcm_conversion_executor)
                 await pcm_chunk_queue.put(pcm_data)
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] S3Gen: Queued final remaining audio chunk.")
 
         except Exception as e:
-            log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-            log.error(f"{log_prefix}[{params.request_id}] Error in S3Gen consumer task: {e}", exc_info=True)
+            log.error(f"[{params.request_id}] Error in PCM consumer task: {e}", exc_info=True)
         finally:
-            await pcm_chunk_queue.put(None) # Signal end of all audio
+            await pcm_chunk_queue.put(None)
 
 
     async def stream(
@@ -663,13 +634,15 @@ class TextToSpeechEngine:
 
         # 3. Setup Queues and CUDA Streams
         speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
+        gpu_audio_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
         pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
-        t3_stream = torch.cuda.Stream() if self.device.startswith('cuda') else None
-        s3gen_stream = torch.cuda.Stream() if self.device.startswith('cuda') else None
+        is_cuda = self.device.startswith('cuda')
+        t3_stream = torch.cuda.Stream() if is_cuda else None
+        s3gen_stream = torch.cuda.Stream() if is_cuda else None
 
         # 4. Create Synthesis Parameters
         synthesis_params = SynthesisParams(
-            text_tokens=None, # This will be set per-chunk in the producer
+            text_tokens=None,
             conds=conds,
             cfg_guidance_weight=cfg_guidance_weight,
             synthesis_temperature=synthesis_temperature,
@@ -685,11 +658,14 @@ class TextToSpeechEngine:
         )
 
         # 5. Start Producer and Consumer Tasks
-        producer_task = asyncio.create_task(
+        t3_producer = asyncio.create_task(
             self._t3_producer_task(text_chunks, speech_token_queue, synthesis_params, t3_stream, s3gen_stream)
         )
-        consumer_task = asyncio.create_task(
-            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
+        s3gen_producer = asyncio.create_task(
+            self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, synthesis_params, s3gen_stream)
+        )
+        pcm_consumer = asyncio.create_task(
+            self._pcm_consumer_task(gpu_audio_queue, pcm_chunk_queue, synthesis_params)
         )
 
         # 6. Setup Audio Encoder
@@ -714,9 +690,10 @@ class TextToSpeechEngine:
                 yield audio_chunk
         finally:
             # Cleanup: Cancel tasks and clear tensors
-            producer_task.cancel()
-            consumer_task.cancel()
-            await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
+            tasks = [t3_producer, s3gen_producer, pcm_consumer]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
