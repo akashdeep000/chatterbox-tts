@@ -19,10 +19,6 @@ class AppConfig(BaseSettings):
         default=False,
         description="Enable debug mode for the application server."
     )
-    WORKERS_COUNT: int = Field(
-        default=1,
-        description="Number of worker processes for the application server. Defaults to 1."
-    )
     # Logging configuration
     LOG_LEVEL: str = Field(
         default="INFO",

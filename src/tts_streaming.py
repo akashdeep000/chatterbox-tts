@@ -9,6 +9,7 @@ and audio generation with performance optimizations.
 # Standard library imports
 from dataclasses import dataclass
 from pathlib import Path
+import os
 from typing import Literal, Optional, Generator, AsyncGenerator, AsyncIterator
 import io
 import gc
@@ -162,6 +163,7 @@ class TextToSpeechEngine:
         Initializes the TTS engine, setting up basic attributes.
         Model loading and device setup are handled asynchronously by `ainit`.
         """
+        self.worker_id = os.environ.get("WORKER_ID", "cpu")
         self.device = None # Will be set during async initialization
         self.t3_stream = None
         self.s3gen_stream = None
@@ -193,9 +195,9 @@ class TextToSpeechEngine:
                 self.device = "cpu"
 
 
-            log.info(f"Initializing Chatterbox TTS model...")
-            log.info(f"Device: {self.device}")
-            log.info(f"Model path: {settings.MODEL_PATH}")
+            log.info(f"[{self.worker_id}] Initializing Chatterbox TTS model...")
+            log.info(f"[{self.worker_id}] Device: {self.device}")
+            log.info(f"[{self.worker_id}] Model path: {settings.MODEL_PATH}")
 
             self.t3_stream = None
             self.s3gen_stream = None
@@ -243,14 +245,14 @@ class TextToSpeechEngine:
             self._initialization_state = InitializationState.READY
             self._initialization_progress = "Model ready"
             self._initialization_error = None
-            log.info(f"✓ Model initialized successfully on {self.device}")
+            log.info(f"✓ [{self.worker_id}] Model initialized successfully on {self.device}")
             return self.tts
 
         except Exception as e:
             self._initialization_state = InitializationState.ERROR
             self._initialization_error = str(e)
             self._initialization_progress = f"Failed: {str(e)}"
-            log.error(f"✗ Failed to initialize model: {e}")
+            log.error(f"✗ [{self.worker_id}] Failed to initialize model: {e}")
             raise e
 
     def get_initialization_status(self) -> dict:
@@ -299,11 +301,11 @@ class TextToSpeechEngine:
         """Prepares and retrieves the appropriate conditionals."""
         voice_id = Path(audio_prompt_path).name if audio_prompt_path else "default"
         if audio_prompt_path and voice_id not in self.voice_cache:
-            log.info(f"Voice '{voice_id}' not in cache. Preparing new conditionals...")
+            log.info(f"[{self.worker_id}] Voice '{voice_id}' not in cache. Preparing new conditionals...")
             await loop.run_in_executor(None, self.prepare_conditionals, audio_prompt_path, voice_exaggeration_factor)
-            log.info(f"Finished preparing conditionals for '{voice_id}'.")
+            log.info(f"[{self.worker_id}] Finished preparing conditionals for '{voice_id}'.")
         elif audio_prompt_path:
-            log.info(f"Using cached conditionals for voice '{voice_id}'.")
+            log.info(f"[{self.worker_id}] Using cached conditionals for voice '{voice_id}'.")
 
         conds = self.voice_cache.get(voice_id)
         if conds is None:
@@ -356,7 +358,7 @@ class TextToSpeechEngine:
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
 
-                log.info(f"T3: Processing text chunk {i+1}/{num_chunks}")
+                log.info(f"[{self.worker_id}] T3: Processing text chunk {i+1}/{num_chunks}")
                 # 1. Text to Tokens
                 text_tokens = await loop.run_in_executor(
                     None, self.tts.tokenizer.text_to_tokens, chunk
@@ -370,7 +372,7 @@ class TextToSpeechEngine:
                 text_tokens = F.pad(F.pad(text_tokens, (1, 0), value=sot), (0, 1), value=eot)
 
                 # 2. T3 Inference (blocking)
-                log.info(f"T3: Starting inference for chunk {i+1}/{num_chunks}")
+                log.info(f"[{self.worker_id}] T3: Starting inference for chunk {i+1}/{num_chunks}")
                 # 3. T3 Inference (non-blocking)
                 sync_token_generator = await loop.run_in_executor(
                     None,
@@ -428,10 +430,10 @@ class TextToSpeechEngine:
                     if generator_exhausted and not current_slice:
                         break
 
-                log.info(f"T3: Finished inference for chunk {i+1}/{num_chunks}, produced {slice_idx} slices.")
+                log.info(f"[{self.worker_id}] T3: Finished inference for chunk {i+1}/{num_chunks}, produced {slice_idx} slices.")
 
         except Exception as e:
-            log.error(f"Error in T3 producer task: {e}", exc_info=True)
+            log.error(f"[{self.worker_id}] Error in T3 producer task: {e}", exc_info=True)
         finally:
             await speech_token_queue.put(None) # Signal end of production
 
@@ -461,7 +463,7 @@ class TextToSpeechEngine:
 
                 token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk = queue_item
                 log.info(
-                    f"S3Gen: Starting inference for slice {slice_num} "
+                    f"[{self.worker_id}] S3Gen: Starting inference for slice {slice_num} "
                     f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
                 )
                 # Reset state for new text chunks
@@ -493,7 +495,7 @@ class TextToSpeechEngine:
 
                 # If, after filtering, we have no valid tokens, skip this slice entirely.
                 if speech_tokens_for_inference.shape[-1] == 0:
-                    log.warning("Skipping a slice because it contained no valid tokens after filtering.")
+                    log.warning(f"[{self.worker_id}] Skipping a slice because it contained no valid tokens after filtering.")
                     speech_token_queue.task_done()
                     continue
 
@@ -545,7 +547,7 @@ class TextToSpeechEngine:
                     # --- First Chunk Logic ---
                     # Send the first chunk immediately without cross-fading.
                     # This is critical for reducing time-to-first-audio.
-                    log.debug("First audio chunk generated. Sending immediately.")
+                    log.debug(f"[{self.worker_id}] First audio chunk generated. Sending immediately.")
                     # We send the main body and store the tail for the next fade.
                     if fade_len > 0 and current_audio_chunk.shape[0] > fade_len:
                          output_to_send = current_audio_chunk[:-fade_len]
@@ -598,26 +600,23 @@ class TextToSpeechEngine:
                             previous_audio_chunk = current_audio_chunk # Or store the whole thing if it's too short
 
                 if output_to_send is not None and output_to_send.shape[0] > 0:
-                    log.debug(f"Sending {output_to_send.shape[0]} samples to audio queue")
+                    log.debug(f"[{self.worker_id}] Sending {output_to_send.shape[0]} samples to audio queue")
                     pcm_data = await self.audio_processor.to_pcm(output_to_send, loop)
                     await pcm_chunk_queue.put(pcm_data)
 
                 speech_token_queue.task_done()
         except Exception as e:
-            log.error(f"Error in S3Gen consumer task: {e}", exc_info=True)
+            log.error(f"[{self.worker_id}] Error in S3Gen consumer task: {e}", exc_info=True)
         finally:
             # After the loop, send any final remaining audio chunk (likely the last tail).
             if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
-                log.debug(f"Sending the final remaining audio tail of {previous_audio_chunk.shape[0]} samples.")
+                log.debug(f"[{self.worker_id}] Sending the final remaining audio tail of {previous_audio_chunk.shape[0]} samples.")
                 pcm_data = await self.audio_processor.to_pcm(previous_audio_chunk, loop)
                 await pcm_chunk_queue.put(pcm_data)
 
             await pcm_chunk_queue.put(None)  # Signal end of audio stream
 
-            log.info(
-                    f"S3Gen: Finished inference for slice {slice_num} "
-                    f"(from text chunk {text_chunk_num}/{params.text_chunk_count})"
-                )
+            log.info(f"[{self.worker_id}] S3Gen: Finished inference for slice {slice_num} (from text chunk {text_chunk_num}/{params.text_chunk_count})")
 
     async def stream(
         self,
@@ -683,13 +682,13 @@ class TextToSpeechEngine:
         try:
             async for encoded_chunk in encoded_stream:
                 yield_count += 1
-                log.debug(f"Sending {len(encoded_chunk)} bytes to client (chunk {yield_count})")
+                log.debug(f"[{self.worker_id}] Sending {len(encoded_chunk)} bytes to client (chunk {yield_count})")
                 yield encoded_chunk
 
         finally:
             # This block now correctly waits for the client to be done, then cleans up.
-            log.info("Client stream finished or disconnected. Cleaning up TTS tasks.")
+            log.info(f"[{self.worker_id}] Client stream finished or disconnected. Cleaning up TTS tasks.")
             producer_task.cancel()
             consumer_task.cancel()
             await asyncio.gather(producer_task, consumer_task, return_exceptions=True)
-            log.info("TTS generation tasks cancelled and gathered.")
+            log.info(f"[{self.worker_id}] TTS generation tasks cancelled and gathered.")
