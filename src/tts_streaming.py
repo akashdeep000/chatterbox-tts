@@ -706,7 +706,7 @@ class TextToSpeechEngine:
         )
 
         # 6. Setup Audio Encoder
-        encoder = AudioEncoder(output_format, self.sr)
+        encoder = AudioEncoder(output_format, self.sr, request=request)
 
         async def pcm_generator():
             """Generator that yields PCM chunks from the queue."""

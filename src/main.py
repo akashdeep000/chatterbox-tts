@@ -1,8 +1,7 @@
+import warnings
 # Suppress the specific UserWarning from pkg_resources
 # This is coming from a dependency (perth) and is safe to ignore for now.
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
-
-import warnings
 
 # Suppress the specific UserWarning from pkg_resources
 # This is coming from a dependency (perth) and is safe to ignore for now.
