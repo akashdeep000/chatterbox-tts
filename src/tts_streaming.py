@@ -176,6 +176,7 @@ class TextToSpeechEngine:
         self._initialization_state: InitializationState = InitializationState.NOT_STARTED
         self._initialization_progress: str = ""
         self._initialization_error: Optional[str] = None
+        self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_GPU)
 
     async def ainit(self):
         """

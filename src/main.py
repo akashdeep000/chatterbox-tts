@@ -345,28 +345,43 @@ def create_app() -> FastAPI:
         accept_header = request.headers.get("Accept")
         output_format, media_type = get_output_format_and_media_type(accept_header, tts_request.format)
 
+        request_id = request.state.request_id
+        logger.info(f"[{request_id}] Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format}). Waiting for semaphore...")
+
         try:
-            request_id = request.state.request_id
-            logger.info(f"[{request_id}] Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format})")
+            await tts_engine.tts_semaphore.acquire()
+            logger.info(f"[{request_id}] Semaphore acquired. Starting TTS generation.")
             start_time = time.time()
-            audio_stream = tts_engine.stream(
-                text=tts_request.text,
-                output_format=output_format,
-                voice_id=tts_request.voice_id,
-                cfg_guidance_weight=tts_request.cfg_guidance_weight,
-                synthesis_temperature=tts_request.synthesis_temperature,
-                text_processing_chunk_size=tts_request.text_processing_chunk_size,
-                audio_tokens_per_slice=tts_request.audio_tokens_per_slice,
-                remove_trailing_milliseconds=tts_request.remove_trailing_milliseconds,
-                remove_leading_milliseconds=tts_request.remove_leading_milliseconds,
-                chunk_overlap_strategy=tts_request.chunk_overlap_strategy,
-                crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
-                start_time=start_time,
-                request_id=request_id
-            )
-            return StreamingResponse(audio_stream, media_type=media_type)
+
+            async def stream_generator():
+                try:
+                    audio_stream = tts_engine.stream(
+                        text=tts_request.text,
+                        output_format=output_format,
+                        voice_id=tts_request.voice_id,
+                        cfg_guidance_weight=tts_request.cfg_guidance_weight,
+                        synthesis_temperature=tts_request.synthesis_temperature,
+                        text_processing_chunk_size=tts_request.text_processing_chunk_size,
+                        audio_tokens_per_slice=tts_request.audio_tokens_per_slice,
+                        remove_trailing_milliseconds=tts_request.remove_trailing_milliseconds,
+                        remove_leading_milliseconds=tts_request.remove_leading_milliseconds,
+                        chunk_overlap_strategy=tts_request.chunk_overlap_strategy,
+                        crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
+                        start_time=start_time,
+                        request_id=request_id
+                    )
+                    async for chunk in audio_stream:
+                        yield chunk
+                finally:
+                    tts_engine.tts_semaphore.release()
+                    logger.info(f"[{request_id}] Semaphore released. TTS generation finished.")
+
+            return StreamingResponse(stream_generator(), media_type=media_type)
         except Exception as e:
-            logger.error(f"[{request.state.request_id}] TTS generation failed: {e}", exc_info=True)
+            logger.error(f"[{request_id}] TTS generation failed: {e}", exc_info=True)
+            # Ensure semaphore is released in case of an error before streaming starts
+            if tts_engine.tts_semaphore.locked():
+                tts_engine.tts_semaphore.release()
             return JSONResponse(content={"error": "Internal server error"}, status_code=500)
 
 
