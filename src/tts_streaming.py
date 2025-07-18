@@ -165,8 +165,6 @@ class TextToSpeechEngine:
         """
         self.worker_id = worker_id
         self.device = None # Will be set during async initialization
-        self.t3_stream = None
-        self.s3gen_stream = None
         self.tts = None # Will be loaded during async initialization
         self.voice_manager = VoiceManager()
         self.voice_cache: dict[str, Conditionals] = {}
@@ -199,11 +197,6 @@ class TextToSpeechEngine:
             log.info(f"[Worker {self.worker_id}] Initializing Chatterbox TTS model...")
             log.info(f"[Worker {self.worker_id}] Device: {self.device}, Model path: {settings.MODEL_PATH}")
 
-            self.t3_stream = None
-            self.s3gen_stream = None
-            if "cuda" in self.device:
-                self.t3_stream = torch.cuda.Stream()
-                self.s3gen_stream = torch.cuda.Stream()
 
             self._initialization_progress = "Configuring device compatibility..."
             # Patch torch.load for CPU compatibility if needed
@@ -643,6 +636,14 @@ class TextToSpeechEngine:
     ) -> AsyncGenerator[bytes, None]:
         """Streams synthesized audio in the specified format."""
         loop = asyncio.get_running_loop()
+
+        # Create per-request CUDA streams for true concurrency on the GPU
+        t3_stream = None
+        s3gen_stream = None
+        if "cuda" in self.device:
+            t3_stream = torch.cuda.Stream()
+            s3gen_stream = torch.cuda.Stream()
+
         audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
         conds = await self._prepare_and_get_conds(audio_prompt_path, voice_exaggeration_factor, loop, request_id)
         yield_count = 0 # Counts the number of chunks yielded to the client
@@ -669,10 +670,10 @@ class TextToSpeechEngine:
         pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
 
         producer_task = loop.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, params, self.t3_stream)
+            self._t3_producer_task(text_chunks, speech_token_queue, params, t3_stream)
         )
         consumer_task = loop.create_task(
-            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, params, self.s3gen_stream)
+            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, params, s3gen_stream)
         )
 
         async def pcm_generator():

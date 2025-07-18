@@ -4,42 +4,52 @@ Chatterbox TTS is a high-performance, containerized Text-to-Speech (TTS) service
 
 ## Project Overview
 
-This project provides a flexible and scalable solution for generating speech from text. It exposes a RESTful API for generating complete audio files and is built to be easily deployable and managed as a serverless endpoint.
+This project provides a flexible and scalable solution for generating speech from text. It exposes a robust RESTful API for real-time streaming and is built for stable, concurrent request handling in a production environment.
 
 ### High-Level Architecture
 
-The following diagram illustrates the high-level architecture of the Chatterbox TTS service:
+The service uses a multi-worker architecture where each available GPU is assigned its own dedicated worker process. This is managed by a single `uvicorn` instance that listens on one port and distributes incoming requests to the pool of workers. This model provides true parallelism, maximizing GPU utilization and overall throughput.
+
+A semaphore is used to control the number of concurrent TTS tasks that can run on a single GPU, preventing overload while leaving other API endpoints responsive. Each concurrent task is processed in its own dedicated CUDA stream for optimal performance.
 
 ```mermaid
 graph TD
     subgraph "Client"
-        A[User Application]
+        A[User Application / Web UI]
     end
 
-    subgraph "Chatterbox TTS Service"
-        B[FastAPI Web Server]
-        C[TTS Engine]
-        D[Voice Manager]
-        E[Voice Cache]
+    subgraph "Chatterbox TTS Service (Single Port)"
+        LB[Uvicorn Master Process]
+
+        subgraph "Worker 0 (Process)"
+            B1[FastAPI App] --> C1{TTS Engine};
+        end
+        subgraph "Worker 1 (Process)"
+            B2[FastAPI App] --> C2{TTS Engine};
+        end
+        subgraph "Worker N (Process)"
+            BN[FastAPI App] --> CN{TTS Engine};
+        end
     end
 
-    subgraph "Infrastructure"
-        F[Docker Container]
-        G[GPU]
-        H[Persistent Volume]
+    subgraph "Hardware Resources"
+        G0[GPU 0]
+        G1[GPU 1]
+        GN[GPU N]
+        H[Persistent Volume for Voices]
     end
 
-    A -- "HTTP Request /tts/generate" --> B
-    B -- "Calls" --> C
-    C -- "Uses" --> G
-    C -- "Requests Voice Conditionals" --> D
-    D -- "Loads/Saves Voices" --> H
-    D -- "Caches Conditionals" --> E
-    C -- "Uses Cached Conditionals" --> E
-    B -- "Streams Audio Response" --> A
+    A -- "HTTP Requests" --> LB
+    LB -- "Round-Robin Distribution" --> B1 & B2 & BN
 
-    style F fill:#f9f,stroke:#333,stroke-width:2px
-    style G fill:#ccf,stroke:#333,stroke-width:2px
+    C1 -- "Runs on" --> G0;
+    C2 -- "Runs on" --> G1;
+    CN -- "Runs on" --> GN;
+    B1 & B2 & BN -- "Load/Save Voices" --> H;
+
+    style G0 fill:#ccf,stroke:#333,stroke-width:2px
+    style G1 fill:#ccf,stroke:#333,stroke-width:2px
+    style GN fill:#ccf,stroke:#333,stroke-width:2px
     style H fill:#cfc,stroke:#333,stroke-width:2px
 ```
 
@@ -52,48 +62,51 @@ To run this project, you will need:
 
 ## Configuration
 
-Before running the application, you must configure the following environment variables. You can set them directly in your shell or create a `.env` file in the project root.
+Configuration is managed via environment variables. You can set them in your shell or create a `.env` file in the project root.
 
-### Application Configuration Parameters
+### Core Application Settings
 
-These parameters are for the overall application settings.
+| Variable                      | Description                                                                                             | Default              |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------- | -------------------- |
+| `API_KEY`                     | **(Required)** Your secret API key for securing the service.                                            | `None`               |
+| `HOST`                        | The host address for the application server.                                                            | `0.0.0.0`            |
+| `PORT`                        | The port for the application server.                                                                    | `8000`               |
+| `DEBUG`                       | Enable debug mode. **Forces worker count to 1.**                                                        | `False`              |
+| `LOG_LEVEL`                   | The logging level (e.g., `INFO`, `DEBUG`).                                                              | `INFO`               |
+| `CONCURRENT_REQUESTS_PER_GPU` | Maximum number of concurrent TTS requests to process per GPU.                                           | `1`                  |
+| `VOICES_DIR`                  | Directory where custom voices are stored.                                                               | `voices/`            |
+| `PRELOADED_VOICES_DIR`        | Directory for preloaded voices.                                                                         | `preloaded-voices/`  |
+| `MODEL_PATH`                  | Path to the directory containing TTS models.                                                            | `models`             |
+| `CORS_ORIGINS`                | A comma-separated list of allowed origins (e.g., `"http://localhost:3000,https://your-frontend.com"`).    | `*`                  |
 
-*   `HOST`: The host address for the application server. Defaults to `0.0.0.0`.
-*   `PORT`: The port for the application server. Defaults to `8000`.
-*   `DEBUG`: Enable or disable debug mode for the application. Defaults to `False`.
-*   `LOG_LEVEL`: The logging level (e.g., `INFO`, `DEBUG`, `WARNING`, `ERROR`). Defaults to `INFO`.
-*   `VOICES_DIR`: Directory where custom voices are stored. Defaults to `voices/`.
-*   `PRELOADED_VOICES_DIR`: Directory for preloaded voices. Defaults to `preloaded-voices/`.
-*   `MODEL_PATH`: Path to the directory containing TTS models. Defaults to `models`.
-*   `API_KEY`: **(Required)** Your secret API key for securing the service.
-*   `CORS_ORIGINS`: A comma-separated list of allowed origins (e.g., `"http://localhost:3000,https://your-frontend.com"`). Defaults to `*` (all origins).
+### TTS Engine Tuning
 
-### TTS Configuration Parameters
+These parameters control the TTS engine's behavior and can be set via environment variables prefixed with `TTS_`.
 
-These parameters control the Text-to-Speech engine's behavior and can be set via environment variables prefixed with `TTS_`.
-
-*   `TTS_VOICE_EXAGGERATION_FACTOR`: Controls the voice_exaggeration_factor of the voice. Higher values increase expressiveness. Defaults to `0.5`.
-*   `TTS_CFG_GUIDANCE_WEIGHT`: Classifier-free guidance weight. Influences how strongly the model adheres to the text prompt. Defaults to `0.5`.
-*   `TTS_SYNTHESIS_TEMPERATURE`: synthesis_temperature for text-to-speech synthesis. Higher values lead to more varied but potentially less coherent output. Defaults to `0.8`.
-*   `TTS_TEXT_PROCESSING_CHUNK_SIZE`: Maximum number of characters per text chunk for processing. Defaults to `100`.
-*   `TTS_AUDIO_TOKENS_PER_SLICE`: Number of audio tokens per slice during streaming synthesis. Defaults to `35`.
-*   `TTS_REMOVE_LEADING_MILLISECONDS`: Duration in milliseconds to remove from the start of generated audio. Defaults to `0`.
-*   `TTS_REMOVE_TRAILING_MILLISECONDS`: Duration in milliseconds to remove from the end of generated audio. Defaults to `0`.
-*   `TTS_CHUNK_OVERLAP_STRATEGY`: Strategy for overlapping audio chunks: `"full"` (overlap and crossfade) or `"zero"` (no overlap). Defaults to `"full"`.
-*   `TTS_CROSSFADE_DURATION_MILLISECONDS`: Duration in milliseconds for crossfading between audio chunks. Defaults to `8`.
+| Variable                            | Description                                                                                             | Default      |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------- | ------------ |
+| `TTS_VOICE_EXAGGERATION_FACTOR`     | Controls the expressiveness of the voice.                                                               | `0.5`        |
+| `TTS_CFG_GUIDANCE_WEIGHT`           | Influences how strongly the model adheres to the text prompt.                                           | `0.5`        |
+| `TTS_SYNTHESIS_TEMPERATURE`         | Controls the randomness of the output.                                                                  | `0.8`        |
+| `TTS_TEXT_PROCESSING_CHUNK_SIZE`    | Max characters per text chunk. Smaller values can reduce latency.                                       | `150`        |
+| `TTS_AUDIO_TOKENS_PER_SLICE`        | Number of audio tokens per slice during streaming. Affects granularity.                                 | `35`         |
+| `TTS_REMOVE_LEADING_MILLISECONDS`   | Milliseconds to trim from the start of the audio.                                                       | `0`          |
+| `TTS_REMOVE_TRAILING_MILLISECONDS`  | Milliseconds to trim from the end of the audio.                                                         | `0`          |
+| `TTS_CHUNK_OVERLAP_STRATEGY`        | Strategy for overlapping audio chunks: `"full"` or `"zero"`.                                            | `"full"`     |
+| `TTS_CROSSFADE_DURATION_MILLISECONDS` | Duration in milliseconds for crossfading between audio chunks.                                          | `30`         |
+| `TTS_SPEECH_TOKEN_QUEUE_MAX_SIZE`   | Buffer size between T3 and S3Gen models. Smaller values (`~2`) reduce initial latency.                  | `2`          |
+| `TTS_PCM_CHUNK_QUEUE_MAX_SIZE`      | Buffer size for outgoing audio. Smaller values (`~3`) reduce latency but increase stutter risk.         | `3`          |
 
 ### Example `.env` file:
 
 ```
+# Server Settings
 API_KEY="your-super-secret-api-key"
-CORS_ORIGINS="http://localhost:3000,https://your-app.com"
-LOG_LEVEL="DEBUG"
+CONCURRENT_REQUESTS_PER_GPU=2 # Allow 2 TTS tasks per GPU
 
-# TTS Configuration
-TTS_VOICE_EXAGGERATION_FACTOR=0.7
-TTS_SYNTHESIS_TEMPERATURE=0.9
-TTS_CHUNK_OVERLAP_STRATEGY="zero"
-TTS_CROSSFADE_DURATION_MILLISECONDS=10
+# TTS Tuning for Low Latency
+TTS_SPEECH_TOKEN_QUEUE_MAX_SIZE=2
+TTS_PCM_CHUNK_QUEUE_MAX_SIZE=3
 ```
 
 ## Setup and Deployment
@@ -166,6 +179,29 @@ To enable the workflow to publish to your Docker Hub account, you need to config
 
 
 ## API Usage
+
+### System Status: `GET /system-status`
+Provides real-time CPU, RAM, and GPU utilization details. Useful for monitoring the health and load of the service.
+
+**Example with `curl`:**
+```bash
+curl -X GET -H "X-API-Key: <YOUR_API_KEY>" http://localhost:8000/system-status
+```
+
+**Example Response:**
+```json
+{
+  "cpu": {
+    "utilization_percent": 25.8,
+    "ram_gb": { "total": 31.26, "used": 8.94, "free": 22.32, "percent_used": 28.6 }
+  },
+  "gpu": {
+    "device_id": 0,
+    "utilization_percent": { "gpu": 45, "memory": 28 },
+    "memory_gb": { "total": 15.75, "used": 3.15, "free": 12.6 }
+  }
+}
+```
 
 ### TTS Generation: `/tts/generate`
 
@@ -301,6 +337,16 @@ The `/tts/generate` endpoint accepts several parameters to customize the audio g
 | `remove_leading_milliseconds` | integer | `TTS_REMOVE_LEADING_MILLISECONDS`| The number of milliseconds to trim from the beginning of the first audio chunk.                                                        |
 | `chunk_overlap_method`      | string  | `TTS_CHUNK_OVERLAP_STRATEGY`    | The method for handling overlapping audio chunks. Can be `"full"` or `"zero"`.                                                         |
 | `crossfade_duration_milliseconds`        | integer   | `TTS_CROSSFADE_DURATION_MILLISECONDS`| The duration of the crossfade between audio chunks in milliseconds.
+
+## Performance & Architecture Deep Dive
+
+The service is engineered for high throughput and low latency via several key design choices:
+
+*   **Multi-Process Parallelism**: By running one process per GPU, we sidestep Python's Global Interpreter Lock (GIL) and achieve true parallel execution of the computationally expensive TTS models.
+*   **Route-Specific Concurrency Control**: A configurable `asyncio.Semaphore` protects the `/tts/generate` route, preventing any single GPU from being overloaded while ensuring other API endpoints remain responsive.
+*   **Per-Request CUDA Streams**: When concurrency is set above 1, each TTS task is executed in its own dedicated CUDA stream. This allows the GPU's scheduler to intelligently overlap operations from different tasks, maximizing hardware utilization.
+*   **Aggressive Pre-caching**: All available voices are pre-processed and cached in GPU memory at startup, eliminating warm-up latency for the first request of any voice.
+*   **Asynchronous Streaming Pipeline**: A producer-consumer pattern between the two stages of the TTS model (T3 and S3Gen) ensures a smooth, continuous flow of audio data without stalls.
 
 ### Performance Optimizations
 
