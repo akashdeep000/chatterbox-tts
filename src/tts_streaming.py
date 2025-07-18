@@ -467,8 +467,6 @@ class TextToSpeechEngine:
             while True:
                 queue_item = await speech_token_queue.get()
                 if queue_item is None:
-                    if previous_audio_chunk is not None and previous_audio_chunk.numel() > 0:
-                        await gpu_audio_queue.put(previous_audio_chunk)
                     break
 
                 token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk, event = queue_item
@@ -517,7 +515,7 @@ class TextToSpeechEngine:
                 with torch.cuda.stream(s3gen_stream):
                     wav, new_cache_source = await loop.run_in_executor(None, partial_inference)
                 s3gen_inference_time = time.time() - s3gen_start_time
-                log.info(f"{log_prefix}[{params.request_id}] S3Gen: Inference for slice {slice_num} took {s3gen_inference_time:.4f}s")
+                log.info(f"{log_prefix}[{params.request_id}] S3Gen: Inference for slice {slice_num} took {s3gen_inference_time:.4f}s (from text chunk {text_chunk_num}/{params.text_chunk_count})")
                 current_audio_chunk = wav.squeeze(0).detach()
 
                 # 3. Overlap Handling
