@@ -77,9 +77,8 @@ def create_app() -> FastAPI:
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         dependencies.tts_engine_manager = TTSEngineManager(num_gpus=num_gpus)
         dependencies.voice_manager = VoiceManager()
-        dependencies.segmenter = pysbd.Segmenter(language="en", clean=False)
         await dependencies.tts_engine_manager.ainit()
-        logger.info("TTS Engine Manager, Voice Manager, and Segmenter initialized successfully.")
+        logger.info("TTS Engine Manager and Voice Manager initialized successfully.")
 
         # --- Voice Cache Warm-up ---
         logger.info("Warming up voice cache for all engines...")

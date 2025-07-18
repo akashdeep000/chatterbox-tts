@@ -111,7 +111,8 @@ def _split_oversized_segment(text: str, max_length: int) -> List[str]:
     return [chunk.strip() for chunk in final_chunks if chunk.strip()]
 
 
-from .dependencies import get_segmenter
+# Create a single, shared instance of the segmenter to avoid re-initialization costs.
+_segmenter = pysbd.Segmenter(language="en", clean=False)
 
 def split_text_into_chunks(text: str, max_length: int = None) -> list:
     """
@@ -143,8 +144,7 @@ def split_text_into_chunks(text: str, max_length: int = None) -> list:
         text = text[0].upper() + text[1:]
 
     if max_length is None:
-        segmenter = get_segmenter()
-        sentences = segmenter.segment(text)
+        sentences = _segmenter.segment(text)
         result = []
         sentence_enders = {".", "!", "?", "-"}
         for s in sentences:
@@ -156,8 +156,7 @@ def split_text_into_chunks(text: str, max_length: int = None) -> list:
         return result
 
     # 3. Sentence Segmentation
-    segmenter = get_segmenter()
-    sentences = segmenter.segment(text)
+    sentences = _segmenter.segment(text)
 
     chunks = []
     current_chunk = ""
