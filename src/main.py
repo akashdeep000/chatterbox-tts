@@ -217,36 +217,42 @@ def create_app() -> FastAPI:
 
 
         # --- GPU Info ---
-        gpu_data = {"status": "not_available"}
-        if hasattr(request.app.state, 'pynvml_handle') and request.app.state.pynvml_handle:
-            try:
-                import pynvml
-                handle = request.app.state.pynvml_handle
-                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                gpu_data = {
-                    "device_id": 0,
-                    "utilization_percent": {
-                        "gpu": utilization.gpu,
-                        "memory": utilization.memory
-                    },
-                    "memory_gb": {
-                        "total": round(mem_info.total / (1024**3), 2),
-                        "used": round(mem_info.used / (1024**3), 2),
-                        "free": round(mem_info.free / (1024**3), 2)
+        gpus_data = []
+        try:
+            import pynvml
+            # pynvml is initialized at startup, so we can use it directly.
+            device_count = pynvml.nvmlDeviceGetCount()
+            if device_count == 0:
+                gpus_data = {"status": "not_available", "reason": "No NVIDIA GPUs detected."}
+            else:
+                for i in range(device_count):
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    gpu_info = {
+                        "device_id": i,
+                        "utilization_percent": {
+                            "gpu": utilization.gpu,
+                            "memory": utilization.memory
+                        },
+                        "memory_gb": {
+                            "total": round(mem_info.total / (1024**3), 2),
+                            "used": round(mem_info.used / (1024**3), 2),
+                            "free": round(mem_info.free / (1024**3), 2)
+                        }
                     }
-                }
-            except pynvml.NVMLError as e:
-                logger.error(f"NVIDIA driver/library error during status check: {e}", exc_info=True)
-                gpu_data = {"error": f"Could not communicate with NVIDIA driver: {e}"}
-            except Exception as e:
-                logger.error(f"An unexpected error occurred while fetching GPU status: {e}", exc_info=True)
-                gpu_data = {"error": f"An unexpected error occurred: {e}"}
-        else:
-            gpu_data = {"status": "not_available", "reason": "pynvml not initialized at startup."}
+                    gpus_data.append(gpu_info)
+        except pynvml.NVMLError as e:
+            logger.error(f"NVIDIA driver/library error during status check: {e}", exc_info=True)
+            gpus_data = {"error": f"Could not communicate with NVIDIA driver: {e}"}
+        except ImportError:
+            gpus_data = {"status": "not_available", "reason": "pynvml library not installed."}
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while fetching GPU status: {e}", exc_info=True)
+            gpus_data = {"error": f"An unexpected error occurred: {e}"}
 
 
-        return {"cpu": cpu_data, "gpu": gpu_data}
+        return {"cpu": cpu_data, "gpus": gpus_data}
 
 
 

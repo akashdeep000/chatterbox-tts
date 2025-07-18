@@ -74,8 +74,8 @@ Configuration is managed via environment variables. You can set them in your she
 | `DEBUG`                       | Enable debug mode. **Forces worker count to 1.**                                                        | `False`              |
 | `LOG_LEVEL`                   | The logging level (e.g., `INFO`, `DEBUG`).                                                              | `INFO`               |
 | `CONCURRENT_REQUESTS_PER_GPU` | Maximum number of concurrent TTS requests to process per GPU.                                           | `1`                  |
-| `VOICES_DIR`                  | Directory where custom voices are stored.                                                               | `voices/`            |
-| `PRELOADED_VOICES_DIR`        | Directory for preloaded voices.                                                                         | `preloaded-voices/`  |
+| `VOICES_DIR`                  | Directory where custom voices are stored.                                                               | `/app/voices/`            |
+| `PRELOADED_VOICES_DIR`        | Directory for preloaded voices.                                                                         | `/app/preloaded-voices/`  |
 | `MODEL_PATH`                  | Path to the directory containing TTS models.                                                            | `models`             |
 | `CORS_ORIGINS`                | A comma-separated list of allowed origins (e.g., `"http://localhost:3000,https://your-frontend.com"`).    | `*`                  |
 

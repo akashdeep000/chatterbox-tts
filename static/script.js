@@ -293,10 +293,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const cpuUtilText = document.getElementById('cpu-util-text');
     const ramUsageBar = document.getElementById('ram-usage-bar');
     const ramUsageText = document.getElementById('ram-usage-text');
-    const gpuUtilBar = document.getElementById('gpu-util-bar');
-    const gpuUtilText = document.getElementById('gpu-util-text');
-    const vramUsageBar = document.getElementById('vram-usage-bar');
-    const vramUsageText = document.getElementById('vram-usage-text');
+    const gpuStatusContainer = document.getElementById('gpu-status-container');
     const statusError = document.getElementById('status-error');
 
     async function updateSystemStatus() {
@@ -330,23 +327,35 @@ document.addEventListener('DOMContentLoaded', () => {
                 statusError.textContent = `CPU/RAM Error: ${data.cpu.error}`;
             }
 
-            // Update GPU
-            if (data.gpu && !data.gpu.error) {
-                const gpuPercent = data.gpu.utilization_percent.gpu;
-                gpuUtilBar.style.width = `${gpuPercent}%`;
-                gpuUtilText.textContent = `${gpuPercent}%`;
+            // Update GPUs
+            gpuStatusContainer.innerHTML = ''; // Clear previous GPU statuses
+            if (data.gpus && Array.isArray(data.gpus)) {
+                data.gpus.forEach(gpu => {
+                    const gpuPercent = gpu.utilization_percent.gpu;
+                    const vramTotal = gpu.memory_gb.total;
+                    const vramUsed = gpu.memory_gb.used;
+                    const vramPercent = vramTotal > 0 ? (vramUsed / vramTotal) * 100 : 0;
 
-                const vramTotal = data.gpu.memory_gb.total;
-                const vramUsed = data.gpu.memory_gb.used;
-                const vramPercent = vramTotal > 0 ? (vramUsed / vramTotal) * 100 : 0;
-                vramUsageBar.style.width = `${vramPercent}%`;
-                vramUsageText.textContent = `${vramUsed} / ${vramTotal} GB (${vramPercent.toFixed(1)}%)`;
-            } else {
-                // Don't overwrite CPU error if GPU is also unavailable
+                    const gpuElement = document.createElement('div');
+                    gpuElement.className = 'status-item';
+                    gpuElement.innerHTML = `
+                        <label>GPU ${gpu.device_id} Utilization:</label>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar gpu" style="width: ${gpuPercent}%;">${gpuPercent}%</div>
+                        </div>
+                        <label>VRAM Usage (GPU ${gpu.device_id}):</label>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar gpu" style="width: ${vramPercent.toFixed(1)}%;">${vramUsed} / ${vramTotal} GB</div>
+                        </div>
+                    `;
+                    gpuStatusContainer.appendChild(gpuElement);
+                });
+            } else if (data.gpus && data.gpus.error) {
                 if (!statusError.textContent) {
-                    statusError.textContent = `GPU Error: ${data.gpu.error || data.gpu.reason}`;
+                    statusError.textContent = `GPU Error: ${data.gpus.error || data.gpus.reason}`;
                 }
             }
+
 
         } catch (error) {
             console.error('Error fetching system status:', error);
