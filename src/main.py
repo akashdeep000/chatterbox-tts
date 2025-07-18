@@ -1,5 +1,3 @@
-import warnings
-
 # Suppress the specific UserWarning from pkg_resources
 # This is coming from a dependency (perth) and is safe to ignore for now.
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
@@ -22,8 +20,7 @@ import time
 from typing import Optional
 import asyncio
 import uuid
-from filelock import FileLock
-from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 
 from .config import settings, tts_config
 import torch
@@ -61,6 +58,11 @@ def create_app() -> FastAPI:
         """
         Initializes the TTS Engine Manager, Voice Manager, and NVML for GPU monitoring.
         """
+        # Create a shared process pool for CPU-bound work.
+        # The number of workers is configured via the CPU_WORKER_COUNT setting.
+        app.state.process_pool = ProcessPoolExecutor(max_workers=settings.CPU_WORKER_COUNT)
+        logger.info(f"Initialized ProcessPoolExecutor with {settings.CPU_WORKER_COUNT} workers.")
+
         # --- NVML Initialization ---
         try:
             import pynvml
@@ -76,8 +78,9 @@ def create_app() -> FastAPI:
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         dependencies.tts_engine_manager = TTSEngineManager(num_gpus=num_gpus)
         dependencies.voice_manager = VoiceManager()
+        dependencies.segmenter = pysbd.Segmenter(language="en", clean=False)
         await dependencies.tts_engine_manager.ainit()
-        logger.info("TTS Engine Manager and Voice Manager initialized successfully.")
+        logger.info("TTS Engine Manager, Voice Manager, and Segmenter initialized successfully.")
 
         # --- Voice Cache Warm-up ---
         logger.info("Warming up voice cache for all engines...")
@@ -106,6 +109,10 @@ def create_app() -> FastAPI:
         """
         Cleans up resources, like shutting down NVML.
         """
+        # Clean up the process pool
+        if hasattr(app.state, 'process_pool'):
+            app.state.process_pool.shutdown(wait=True)
+
         if getattr(app.state, 'pynvml_initialized', False):
             try:
                 import pynvml
@@ -394,7 +401,8 @@ def create_app() -> FastAPI:
                         chunk_overlap_strategy=tts_request.chunk_overlap_strategy,
                         crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
                         start_time=start_time,
-                        request_id=request_id
+                        request_id=request_id,
+                        request=request
                     )
                     async for chunk in audio_stream:
                         yield chunk

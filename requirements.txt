@@ -13,4 +13,3 @@ pysbd
 ffmpeg-python
 pynvml
 psutil
-filelock

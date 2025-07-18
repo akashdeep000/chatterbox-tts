@@ -111,6 +111,8 @@ def _split_oversized_segment(text: str, max_length: int) -> List[str]:
     return [chunk.strip() for chunk in final_chunks if chunk.strip()]
 
 
+from .dependencies import get_segmenter
+
 def split_text_into_chunks(text: str, max_length: int = None) -> list:
     """
     Normalizes and splits text into manageable chunks for TTS processing.
@@ -141,8 +143,8 @@ def split_text_into_chunks(text: str, max_length: int = None) -> list:
         text = text[0].upper() + text[1:]
 
     if max_length is None:
-        seg = pysbd.Segmenter(language="en", clean=False)
-        sentences = seg.segment(text)
+        segmenter = get_segmenter()
+        sentences = segmenter.segment(text)
         result = []
         sentence_enders = {".", "!", "?", "-"}
         for s in sentences:
@@ -154,8 +156,8 @@ def split_text_into_chunks(text: str, max_length: int = None) -> list:
         return result
 
     # 3. Sentence Segmentation
-    seg = pysbd.Segmenter(language="en", clean=False)
-    sentences = seg.segment(text)
+    segmenter = get_segmenter()
+    sentences = segmenter.segment(text)
 
     chunks = []
     current_chunk = ""

@@ -1,6 +1,7 @@
 import os
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
 
 class AppConfig(BaseSettings):
     """
@@ -53,6 +54,11 @@ class AppConfig(BaseSettings):
     CONCURRENT_REQUESTS_PER_GPU: int = Field(
         default=1,
         description="Maximum number of concurrent TTS requests to process per GPU."
+    )
+
+    CPU_WORKER_COUNT: int = Field(
+        default_factory=lambda: os.cpu_count() or 1,
+        description="Number of worker processes for the CPU-bound task executor. Defaults to the number of available CPU cores."
     )
 
     class Config:
