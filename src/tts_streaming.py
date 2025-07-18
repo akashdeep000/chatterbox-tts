@@ -110,27 +110,6 @@ class SynthesisParams:
 class _AudioProcessor:
     """Handles audio processing tasks like WAV header creation and PCM conversion."""
 
-    # TODO: Remove this method once we can stream the WAV header
-    # @staticmethod
-    # def create_wav_header(sample_rate: int, channels: int = 1, sample_width: int = 2) -> bytes:
-    #     """Creates a WAV file header for streaming."""
-    #     data_size = 0xFFFFFFFF  # Set to 0xFFFFFFFF for streaming to indicate unknown size
-    #     header = io.BytesIO()
-    #     header.write(b'RIFF')
-    #     header.write((data_size).to_bytes(4, 'little')) # Set to data_size (0xFFFFFFFF) for streaming
-    #     header.write(b'WAVEfmt ')
-    #     header.write((16).to_bytes(4, 'little'))
-    #     header.write((1).to_bytes(2, 'little'))
-    #     header.write(channels.to_bytes(2, 'little'))
-    #     header.write(sample_rate.to_bytes(4, 'little'))
-    #     header.write((sample_rate * channels * sample_width).to_bytes(4, 'little'))
-    #     header.write((channels * sample_width).to_bytes(2, 'little'))
-    #     header.write((sample_width * 8).to_bytes(2, 'little'))
-    #     header.write(b'data')
-    #     header.write(data_size.to_bytes(4, 'little'))
-    #     header.seek(0)
-    #     return header.read()
-
     @staticmethod
     async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop) -> bytes:
         """

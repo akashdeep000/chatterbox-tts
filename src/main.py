@@ -22,7 +22,8 @@ import time
 from typing import Optional
 import asyncio
 import uuid
-import multiprocessing
+from filelock import FileLock
+from pathlib import Path
 
 from .config import settings, tts_config
 from .dependencies import get_tts_engine, get_voice_manager
@@ -34,9 +35,6 @@ from fastapi import File, UploadFile
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
-
-# A shared counter to assign a unique ID to each worker process
-worker_id_counter = multiprocessing.Value('i', -1)
 
 def create_app() -> FastAPI:
     """
@@ -50,10 +48,18 @@ def create_app() -> FastAPI:
         """
         Initializes the TTS engine, Voice Manager, and NVML for GPU monitoring.
         """
-        # --- Assign a unique ID to this worker ---
-        with worker_id_counter.get_lock():
-            worker_id_counter.value += 1
-            worker_id = worker_id_counter.value
+        # --- Assign a unique ID to this worker using a file-based lock ---
+        counter_file = Path("/tmp/worker_counter.txt")
+        lock_file = Path("/tmp/worker_counter.lock")
+
+        with FileLock(lock_file):
+            if not counter_file.exists():
+                counter_file.write_text("-1")
+
+            worker_counter = int(counter_file.read_text())
+            worker_counter += 1
+            counter_file.write_text(str(worker_counter))
+            worker_id = worker_counter
 
         # --- NVML Initialization ---
         try:
