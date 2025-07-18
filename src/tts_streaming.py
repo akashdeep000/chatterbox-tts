@@ -126,10 +126,7 @@ class _AudioProcessor:
             return pcm_data
 
         # Offload the blocking CPU operations to a separate thread
-        process_pool = loop.get_default_executor()
-        if hasattr(loop, 'process_pool'):
-            process_pool = loop.process_pool
-        return await loop.run_in_executor(process_pool, _blocking_conversion)
+        return await loop.run_in_executor(None, _blocking_conversion)
 
 
 class TextToSpeechEngine:
@@ -158,7 +155,6 @@ class TextToSpeechEngine:
         self._initialization_progress: str = ""
         self._initialization_error: Optional[str] = None
         self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_GPU)
-        self._cache_lock = asyncio.Lock()
 
     async def ainit(self):
         """
@@ -283,15 +279,12 @@ class TextToSpeechEngine:
         """Prepares and retrieves the appropriate conditionals."""
         log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
         voice_id = Path(audio_prompt_path).name if audio_prompt_path else "default"
-
-        # Use a lock to prevent race conditions when preparing the same voice multiple times
-        async with self._cache_lock:
-            if audio_prompt_path and voice_id not in self.voice_cache:
-                log.info(f"{log_prefix}[{request_id}] Voice '{voice_id}' not in cache. Preparing new conditionals...")
-                await loop.run_in_executor(None, self.prepare_conditionals, audio_prompt_path, voice_exaggeration_factor)
-                log.info(f"{log_prefix}[{request_id}] Finished preparing conditionals for '{voice_id}'.")
-            elif audio_prompt_path:
-                log.info(f"{log_prefix}[{request_id}] Using cached conditionals for voice '{voice_id}'.")
+        if audio_prompt_path and voice_id not in self.voice_cache:
+            log.info(f"{log_prefix}[{request_id}] Voice '{voice_id}' not in cache. Preparing new conditionals...")
+            await loop.run_in_executor(None, self.prepare_conditionals, audio_prompt_path, voice_exaggeration_factor)
+            log.info(f"{log_prefix}[{request_id}] Finished preparing conditionals for '{voice_id}'.")
+        elif audio_prompt_path:
+            log.info(f"{log_prefix}[{request_id}] Using cached conditionals for voice '{voice_id}'.")
 
         conds = self.voice_cache.get(voice_id)
         if conds is None:
@@ -348,11 +341,8 @@ class TextToSpeechEngine:
                 log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
                 log.info(f"{log_prefix}[{params.request_id}] T3: Processing text chunk {i+1}/{num_chunks}")
                 # 1. Text to Tokens
-                process_pool = loop.get_default_executor()
-                if hasattr(loop, 'process_pool'):
-                    process_pool = loop.process_pool
                 text_tokens = await loop.run_in_executor(
-                    process_pool, self.tts.tokenizer.text_to_tokens, chunk
+                    None, self.tts.tokenizer.text_to_tokens, chunk
                 )
                 # Move text_tokens to the correct device
                 text_tokens = text_tokens.to(self.device)
@@ -612,7 +602,7 @@ class TextToSpeechEngine:
                     previous_audio_chunk = None # Reset for the next text chunk
 
 
-                # 5. Queue the processed audio chunk for output
+                # 4. Queue the processed audio chunk for output
                 if chunk_to_send is not None and chunk_to_send.shape[0] > 0:
                     pcm_data = await self.audio_processor.to_pcm(chunk_to_send, loop)
                     await pcm_chunk_queue.put(pcm_data)
@@ -651,16 +641,13 @@ class TextToSpeechEngine:
         chunk_overlap_strategy: Literal["zero", "full"] = "zero",
         crossfade_duration_milliseconds: int = 20,
         start_time: float = 0.0,
-        request_id: str = "N/A",
-        request: Optional[object] = None
+        request_id: str = "N/A"
     ) -> AsyncGenerator[bytes, None]:
         """Streams synthesized audio in the specified format."""
         if self._initialization_state != InitializationState.READY:
             raise RuntimeError(f"TTS Engine on GPU {self.gpu_id} is not ready. Status: {self._initialization_state.value}")
 
         loop = asyncio.get_running_loop()
-        if request and hasattr(request.app.state, 'process_pool'):
-            loop.process_pool = request.app.state.process_pool
         first_chunk_generated = False
         time_to_first_chunk = 0.0
 
@@ -706,7 +693,7 @@ class TextToSpeechEngine:
         )
 
         # 6. Setup Audio Encoder
-        encoder = AudioEncoder(output_format, self.sr, request=request)
+        encoder = AudioEncoder(output_format, self.sr)
 
         async def pcm_generator():
             """Generator that yields PCM chunks from the queue."""

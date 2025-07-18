@@ -20,7 +20,7 @@ class AudioEncoder:
     """Multi-format audio encoder with instant chunk processing for true real-time streaming."""
 
     def __init__(self, output_format: str, sample_rate: int, channels: int = 1,
-                 bit_depth: int = 16, request: Optional[object] = None, **kwargs):
+                 bit_depth: int = 16, **kwargs):
         """
         Initialize the audio encoder.
 
@@ -29,11 +29,9 @@ class AudioEncoder:
             sample_rate: Audio sample rate in Hz
             channels: Number of audio channels (1=mono, 2=stereo)
             bit_depth: Bits per sample (8, 16, 24, 32)
-            request: The FastAPI request object, used to access the process pool.
             **kwargs: Additional format-specific options
         """
         self.output_format = AudioFormat(output_format.lower())
-        self.request = request
         self.sample_rate = sample_rate
         self.channels = channels
         self.bit_depth = bit_depth
@@ -260,17 +258,12 @@ class AudioEncoder:
         try:
             async for pcm_chunk in pcm_generator:
                 if self.ffmpeg_process and self.ffmpeg_process.stdin:
-                    # Write immediately, no buffering, using the process pool if available
-                    loop = asyncio.get_event_loop()
-                    executor = None
-                    if self.request and hasattr(self.request.app.state, 'process_pool'):
-                        executor = self.request.app.state.process_pool
-
-                    await loop.run_in_executor(
-                        executor, self.ffmpeg_process.stdin.write, pcm_chunk
+                    # Write immediately, no buffering
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self.ffmpeg_process.stdin.write, pcm_chunk
                     )
-                    await loop.run_in_executor(
-                        executor, self.ffmpeg_process.stdin.flush
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self.ffmpeg_process.stdin.flush
                     )
         except Exception as e:
             log.error(f"Error writing to FFmpeg: {e}")
@@ -288,14 +281,9 @@ class AudioEncoder:
 
         try:
             while True:
-                # Read small chunks for instant processing, using the process pool if available
-                loop = asyncio.get_event_loop()
-                executor = None
-                if self.request and hasattr(self.request.app.state, 'process_pool'):
-                    executor = self.request.app.state.process_pool
-
-                chunk = await loop.run_in_executor(
-                    executor, self.ffmpeg_process.stdout.read, 1024
+                # Read small chunks for instant processing
+                chunk = await asyncio.get_event_loop().run_in_executor(
+                    None, self.ffmpeg_process.stdout.read, 1024
                 )
 
                 if not chunk:
