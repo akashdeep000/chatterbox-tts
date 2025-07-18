@@ -20,21 +20,22 @@ class AudioEncoder:
     """Multi-format audio encoder with instant chunk processing for true real-time streaming."""
 
     def __init__(self, output_format: str, sample_rate: int, channels: int = 1,
-                 bit_depth: int = 16, **kwargs):
+                 bit_depth: int = 16, log_prefix: str = "", **kwargs):
         """
         Initialize the audio encoder.
-
         Args:
             output_format: Target format ("wav", "raw_pcm", "fmp4", "mp3", "webm")
             sample_rate: Audio sample rate in Hz
             channels: Number of audio channels (1=mono, 2=stereo)
             bit_depth: Bits per sample (8, 16, 24, 32)
+            log_prefix: Prefix for log messages.
             **kwargs: Additional format-specific options
         """
         self.output_format = AudioFormat(output_format.lower())
         self.sample_rate = sample_rate
         self.channels = channels
         self.bit_depth = bit_depth
+        self.log_prefix = log_prefix
         self.kwargs = kwargs
 
         # Format-specific settings
@@ -266,7 +267,7 @@ class AudioEncoder:
                         None, self.ffmpeg_process.stdin.flush
                     )
         except Exception as e:
-            log.error(f"Error writing to FFmpeg: {e}")
+            log.error(f"{self.log_prefix}Error writing to FFmpeg: {e}")
         finally:
             if self.ffmpeg_process and self.ffmpeg_process.stdin:
                 try:
@@ -293,7 +294,7 @@ class AudioEncoder:
                 yield chunk
 
         except Exception as e:
-            log.error(f"Error reading from FFmpeg: {e}")
+            log.error(f"{self.log_prefix}Error reading from FFmpeg: {e}")
 
     async def _cleanup_ffmpeg(self):
         """Clean up FFmpeg process."""

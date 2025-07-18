@@ -340,6 +340,8 @@ class TextToSpeechEngine:
         self,
         text_chunks: list,
         speech_token_queue: asyncio.Queue,
+        gpu_audio_queue: asyncio.Queue,
+        pcm_chunk_queue: asyncio.Queue,
         params: SynthesisParams,
         t3_stream: Optional[torch.cuda.Stream],
         s3gen_stream: Optional[torch.cuda.Stream],
@@ -347,13 +349,15 @@ class TextToSpeechEngine:
         """Producer task for T3 model. Generates speech tokens and puts them into a queue."""
         num_chunks = len(text_chunks)
         loop = params.loop
+        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
+        log_prefix = f"[{device_str}][{params.request_id}][T3_PRODUCER]"
+
         try:
             for i, chunk in enumerate(text_chunks):
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
 
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] T3: Processing text chunk {i+1}/{num_chunks}")
+                log.info(f"{log_prefix} Processing text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 # 1. Text to Tokens
                 text_tokens = await loop.run_in_executor(
                     None, self.tts.tokenizer.text_to_tokens, chunk
@@ -367,8 +371,7 @@ class TextToSpeechEngine:
                 text_tokens = F.pad(F.pad(text_tokens, (1, 0), value=sot), (0, 1), value=eot)
 
                 # 2. T3 Inference (blocking)
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] T3: Starting inference for chunk {i+1}/{num_chunks}")
+                log.info(f"{log_prefix} Starting inference for chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 # 3. T3 Inference (non-blocking)
                 sync_token_generator = await loop.run_in_executor(
                     None,
@@ -412,7 +415,7 @@ class TextToSpeechEngine:
                         event = torch.cuda.Event() if t3_stream else None
                         if event:
                             event.record(t3_stream)
-                        log.debug(f"Sending slice {slice_idx} - {predicted_tokens.shape[1]} tokens to queue. (from text chunk {i+1}/{num_chunks})")
+                        log.debug(f"{log_prefix} Queuing slice {slice_idx} ({predicted_tokens.shape[1]} tokens) from text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, False, is_first_text_chunk, is_last_text_chunk, event)
                         )
@@ -426,7 +429,7 @@ class TextToSpeechEngine:
                         event = torch.cuda.Event() if t3_stream else None
                         if event:
                             event.record(t3_stream)
-                        log.debug(f"Sending slice {slice_idx} - {predicted_tokens.shape[1]} tokens to queue. (from text chunk {i+1}/{num_chunks})")
+                        log.debug(f"{log_prefix} Queuing LAST slice {slice_idx} ({predicted_tokens.shape[1]} tokens) from text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk, event)
                         )
@@ -438,36 +441,43 @@ class TextToSpeechEngine:
                         break
 
                 t3_inference_time = time.time() - t3_start_time
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] T3: Finished inference for chunk {i+1}/{num_chunks}, produced {slice_idx} slices in {t3_inference_time:.4f}s.")
+                log.info(f"{log_prefix} Finished inference for chunk {i+1}/{num_chunks} ({slice_idx} slices) in {t3_inference_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
 
         except Exception as e:
-            log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-            log.error(f"{log_prefix}[{params.request_id}] Error in T3 producer task: {e}", exc_info=True)
+            log.error(f"{log_prefix} Error: {e}", exc_info=True)
         finally:
+            log.info(f"{log_prefix} Finished. Signaling end of production.")
             await speech_token_queue.put(None) # Signal end of production
 
     async def _s3gen_producer_task(
         self,
         speech_token_queue: asyncio.Queue,
         gpu_audio_queue: asyncio.Queue,
+        pcm_chunk_queue: asyncio.Queue,
         params: SynthesisParams,
         s3gen_stream: Optional[torch.cuda.Stream],
     ):
         """Producer task for S3Gen model. Converts speech tokens to audio chunks, handling all GPU-side processing."""
         loop = params.loop
+        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
+        log_prefix = f"[{device_str}][{params.request_id}][S3GEN_PRODUCER]"
         current_text_chunk_accumulated_tokens = None
         cache_source = torch.zeros(1, 1, 0).to(self.device)
         last_text_chunk_num = -1
         eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
         previous_audio_chunk = None
-        previous_length = 0
+        is_first_audio_chunk_sent = False
 
         try:
             while True:
+                start_time = time.time()
+                log.debug(f"{log_prefix} Waiting for speech tokens. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 queue_item = await speech_token_queue.get()
+                wait_time = time.time() - start_time
+                log.debug(f"{log_prefix} Waited for speech tokens for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 if queue_item is None:
                     if previous_audio_chunk is not None:
+                        log.info(f"{log_prefix} Queuing final audio chunk. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                         # If there's still audio in the queue, queue it as the final chunk
                         await gpu_audio_queue.put((previous_audio_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk))
                     break
@@ -477,10 +487,10 @@ class TextToSpeechEngine:
                 if s3gen_stream and event:
                     s3gen_stream.wait_event(event)
 
-                log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-                log.info(f"{log_prefix}[{params.request_id}] S3Gen: Starting inference for slice {slice_num} (from text chunk {text_chunk_num}/{params.text_chunk_count})")
+                log.info(f"{log_prefix} Starting inference for slice {slice_num} (text chunk {text_chunk_num}/{params.text_chunk_count}). Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
 
                 if text_chunk_num != last_text_chunk_num:
+                    log.debug(f"{log_prefix} New text chunk detected. Resetting S3Gen cache.")
                     current_text_chunk_accumulated_tokens = None
                     cache_source = torch.zeros(1, 1, 0).to(self.device)
                     last_text_chunk_num = text_chunk_num
@@ -518,7 +528,7 @@ class TextToSpeechEngine:
                 with torch.cuda.stream(s3gen_stream):
                     wav, new_cache_source = await loop.run_in_executor(None, partial_inference)
                 s3gen_inference_time = time.time() - s3gen_start_time
-                log.info(f"{log_prefix}[{params.request_id}] S3Gen: Inference for slice {slice_num} took {s3gen_inference_time:.4f}s (from text chunk {text_chunk_num}/{params.text_chunk_count})")
+                log.info(f"{log_prefix} Inference for slice {slice_num} took {s3gen_inference_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 current_audio_chunk = wav.squeeze(0).detach()
 
                 # 3. Overlap Handling
@@ -537,66 +547,93 @@ class TextToSpeechEngine:
                 if is_last_text_chunk and is_last_slice and trailing_samples_to_remove > 0 and current_audio_chunk.shape[0] > trailing_samples_to_remove:
                     current_audio_chunk = current_audio_chunk[:-trailing_samples_to_remove]
 
-                # 5. Cross-fading Logic
-                crossfade_samples = (params.crossfade_duration_milliseconds * self.sr) // 1000
-                if previous_audio_chunk is not None and crossfade_samples > 0:
-                    if previous_audio_chunk.shape[0] > crossfade_samples and current_audio_chunk.shape[0] > crossfade_samples:
-                        fade_out = torch.linspace(1, 0, crossfade_samples, device=self.device)
-                        fade_in = torch.linspace(0, 1, crossfade_samples, device=self.device)
-                        previous_audio_chunk[-crossfade_samples:] *= fade_out
-                        current_audio_chunk[:crossfade_samples] *= fade_in
-                        crossfaded_region = previous_audio_chunk[-crossfade_samples:] + current_audio_chunk[:crossfade_samples]
-                        processed_chunk = torch.cat([previous_audio_chunk[:-crossfade_samples], crossfaded_region, current_audio_chunk[crossfade_samples:]])
-                    else:
-                        processed_chunk = torch.cat([previous_audio_chunk, current_audio_chunk])
-                else:
-                    processed_chunk = current_audio_chunk
+                # 4. Cross-fading and Queueing
+                output_to_send = None
+                fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
 
-                # 6. Buffering for next cross-fade
-                if not is_last_slice:
-                    if processed_chunk.shape[0] > crossfade_samples:
-                        chunk_to_send = processed_chunk[:-crossfade_samples]
-                        previous_audio_chunk = processed_chunk[-crossfade_samples:]
+                if not is_first_audio_chunk_sent:
+                    # --- First Chunk Logic ---
+                    log.debug(f"{log_prefix} First audio chunk generated. Sending immediately.")
+                    if fade_len > 0 and current_audio_chunk.shape[0] > fade_len:
+                         output_to_send = current_audio_chunk[:-fade_len]
+                         previous_audio_chunk = current_audio_chunk[-fade_len:]
                     else:
-                        chunk_to_send = None
-                        previous_audio_chunk = processed_chunk
+                         output_to_send = current_audio_chunk
+                         previous_audio_chunk = None
+                    is_first_audio_chunk_sent = True
                 else:
-                    chunk_to_send = processed_chunk
-                    previous_audio_chunk = None
+                    # --- Standard Cross-fade Logic ---
+                    can_fade = (
+                        params.crossfade_duration_milliseconds > 0
+                        and fade_len > 0
+                        and previous_audio_chunk is not None
+                        and previous_audio_chunk.shape[0] == fade_len
+                        and current_audio_chunk.shape[0] > fade_len
+                    )
 
-                # 7. Queue the final tensor for PCM conversion
-                if chunk_to_send is not None and chunk_to_send.numel() > 0:
-                    await gpu_audio_queue.put((chunk_to_send, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk))
+                    if can_fade:
+                        current_head = current_audio_chunk[:fade_len]
+                        t = torch.linspace(0, 1, fade_len, device=self.device)
+                        fade_out = torch.cos(t * 0.5 * torch.pi)
+                        fade_in = torch.sin(t * 0.5 * torch.pi)
+                        mixed_region = (previous_audio_chunk * fade_out) + (current_head * fade_in)
+
+                        current_main_body = current_audio_chunk[fade_len:-fade_len] if current_audio_chunk.shape[0] > fade_len * 2 else torch.tensor([], device=self.device)
+                        output_to_send = torch.cat((mixed_region, current_main_body))
+                        previous_audio_chunk = current_audio_chunk[-fade_len:]
+                    else:
+                        # --- No fade / Fallback ---
+                        output_to_send = previous_audio_chunk
+                        if fade_len > 0 and current_audio_chunk.shape[0] > fade_len:
+                            previous_audio_chunk = current_audio_chunk[-fade_len:]
+                        else:
+                            previous_audio_chunk = current_audio_chunk
+
+                if output_to_send is not None and output_to_send.shape[0] > 0:
+                    log.debug(f"{log_prefix} Sending {output_to_send.shape[0]} samples to audio queue")
+                    await gpu_audio_queue.put((output_to_send, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk))
 
                 speech_token_queue.task_done()
-
         except Exception as e:
-            log.error(f"[{params.request_id}] Error in S3Gen producer task: {e}", exc_info=True)
+            log.error(f"{log_prefix} Error in S3Gen producer task: {e}", exc_info=True)
         finally:
+            if previous_audio_chunk is not None and previous_audio_chunk.shape[0] > 0:
+                log.debug(f"{log_prefix} Sending the final remaining audio tail of {previous_audio_chunk.shape[0]} samples.")
+                await gpu_audio_queue.put((previous_audio_chunk, text_chunk_num, slice_num, is_first_slice, True, is_first_text_chunk, True))
+
             await gpu_audio_queue.put(None)
 
     async def _pcm_consumer_task(
         self,
+        speech_token_queue: asyncio.Queue,
         gpu_audio_queue: asyncio.Queue,
         pcm_chunk_queue: asyncio.Queue,
         params: SynthesisParams,
     ):
         """Consumes audio tensors from the GPU queue and converts them to PCM data."""
         loop = params.loop
+        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
+        log_prefix = f"[{device_str}][{params.request_id}][PCM_CONSUMER]"
         try:
             while True:
+                start_time = time.time()
+                log.debug(f"{log_prefix} Waiting for audio tensor. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 queue_item = await gpu_audio_queue.get()
+                wait_time = time.time() - start_time
+                log.debug(f"{log_prefix} Waited for audio tensor for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 if queue_item is None:
                     break
                 audio_tensor, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk = queue_item
                 start_time = time.time()
                 pcm_data = await self.audio_processor.to_pcm(audio_tensor, loop, self.pcm_conversion_executor)
-                log.info(f"[{params.request_id}] PCM conversion for slice {slice_num} (from text chunk {text_chunk_num}/{params.text_chunk_count}) took {time.time() - start_time:.4f}s")
+                conversion_time = time.time() - start_time
+                log.info(f"{log_prefix} PCM conversion for slice {slice_num} (text chunk {text_chunk_num}/{params.text_chunk_count}) took {conversion_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 await pcm_chunk_queue.put(pcm_data)
 
         except Exception as e:
-            log.error(f"[{params.request_id}] Error in PCM consumer task: {e}", exc_info=True)
+            log.error(f"{log_prefix} Error: {e}", exc_info=True)
         finally:
+            log.info(f"{log_prefix} Finished. Signaling end of production.")
             await pcm_chunk_queue.put(None)
 
 
@@ -662,22 +699,33 @@ class TextToSpeechEngine:
 
         # 5. Start Producer and Consumer Tasks
         t3_producer = asyncio.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, synthesis_params, t3_stream, s3gen_stream)
+            self._t3_producer_task(text_chunks, speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, t3_stream, s3gen_stream)
         )
         s3gen_producer = asyncio.create_task(
-            self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, synthesis_params, s3gen_stream)
+            self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
         )
         pcm_consumer = asyncio.create_task(
-            self._pcm_consumer_task(gpu_audio_queue, pcm_chunk_queue, synthesis_params)
+            self._pcm_consumer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params)
         )
 
         # 6. Setup Audio Encoder
-        encoder = AudioEncoder(output_format, self.sr)
+        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
+        log_prefix = f"[{device_str}][{request_id}]"
+
+        encoder = AudioEncoder(
+            output_format,
+            self.sr,
+            log_prefix=log_prefix
+        )
 
         async def pcm_generator():
             """Generator that yields PCM chunks from the queue."""
             while True:
+                log.debug(f"{log_prefix} Waiting for PCM chunk. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+                start_time = time.time()
                 chunk = await pcm_chunk_queue.get()
+                wait_time = time.time() - start_time
+                log.debug(f"{log_prefix} Waited for PCM chunk for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 if chunk is None:
                     break
                 yield chunk
@@ -688,7 +736,8 @@ class TextToSpeechEngine:
             async for audio_chunk in encoder.encode(pcm_generator()):
                 if not first_chunk_generated:
                     time_to_first_chunk = time.time() - start_time
-                    log.info(f"[{request_id}] Time to first audio chunk: {time_to_first_chunk:.4f}s")
+                    device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
+                    log.info(f"[{device_str}][{request_id}] Time to first audio chunk: {time_to_first_chunk:.4f}s")
                     first_chunk_generated = True
                 yield audio_chunk
         finally:
