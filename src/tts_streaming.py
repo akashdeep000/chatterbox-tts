@@ -476,10 +476,6 @@ class TextToSpeechEngine:
                 wait_time = time.time() - start_time
                 log.debug(f"{log_prefix} Waited for speech tokens for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 if queue_item is None:
-                    if previous_audio_chunk is not None:
-                        log.info(f"{log_prefix} Queuing final audio chunk. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                        # If there's still audio in the queue, queue it as the final chunk
-                        await gpu_audio_queue.put((previous_audio_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk))
                     break
 
                 token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk, event = queue_item
