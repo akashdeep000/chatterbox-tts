@@ -26,15 +26,28 @@ from filelock import FileLock
 from pathlib import Path
 
 from .config import settings, tts_config
-from .dependencies import get_tts_engine, get_voice_manager
+import torch
+from .dependencies import get_tts_engine_manager, get_voice_manager
 from . import dependencies
-from .tts_streaming import TextToSpeechEngine, InitializationState
+from .tts_streaming import TTSEngineManager, InitializationState
 from .voice_manager import VoiceManager
 from fastapi import File, UploadFile
 
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Filter out logs for specific endpoints
+        if hasattr(record, 'args') and isinstance(record.args, tuple) and len(record.args) > 2:
+            path = record.args[2]
+            if isinstance(path, str) and (path.startswith("/health") or path.startswith("/system-status")):
+                return False
+        return True
+
+# Add the filter to Uvicorn's access logger
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 def create_app() -> FastAPI:
     """
@@ -46,50 +59,40 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event():
         """
-        Initializes the TTS engine, Voice Manager, and NVML for GPU monitoring.
+        Initializes the TTS Engine Manager, Voice Manager, and NVML for GPU monitoring.
         """
-        # --- Assign a unique ID to this worker using a file-based lock ---
-        counter_file = Path("/tmp/worker_counter.txt")
-        lock_file = Path("/tmp/worker_counter.lock")
-
-        with FileLock(lock_file):
-            if not counter_file.exists():
-                counter_file.write_text("-1")
-
-            worker_counter = int(counter_file.read_text())
-            worker_counter += 1
-            counter_file.write_text(str(worker_counter))
-            worker_id = worker_counter
-
         # --- NVML Initialization ---
         try:
             import pynvml
             pynvml.nvmlInit()
-            # Each worker now gets a handle to its specific GPU
-            app.state.pynvml_handle = pynvml.nvmlDeviceGetHandleByIndex(worker_id)
-            logger.info(f"[Worker {worker_id}] pynvml initialized successfully for GPU {worker_id}.")
+            app.state.pynvml_initialized = True
+            logger.info("pynvml initialized successfully.")
         except Exception as e:
-            app.state.pynvml_handle = None
-            logger.warning(f"[Worker {worker_id}] Could not initialize pynvml. GPU status will not be available. Error: {e}")
+            app.state.pynvml_initialized = False
+            logger.warning(f"Could not initialize pynvml. GPU status will not be available. Error: {e}")
 
-        # --- TTS Engine and Voice Manager Initialization ---
-        logger.info(f"[Worker {worker_id}] Initializing TTS engine and Voice Manager...")
-        dependencies.tts_engine = TextToSpeechEngine(worker_id=worker_id)
+        # --- TTS Engine Manager and Voice Manager Initialization ---
+        logger.info("Initializing TTS Engine Manager and Voice Manager...")
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        dependencies.tts_engine_manager = TTSEngineManager(num_gpus=num_gpus)
         dependencies.voice_manager = VoiceManager()
-        await dependencies.tts_engine.ainit() # Call the async initialization method
-        logger.info(f"[Worker {worker_id}] TTS engine and Voice Manager initialized successfully.")
+        await dependencies.tts_engine_manager.ainit()
+        logger.info("TTS Engine Manager and Voice Manager initialized successfully.")
 
         # --- Voice Cache Warm-up ---
-        logger.info("Warming up voice cache...")
+        logger.info("Warming up voice cache for all engines...")
         available_voices = dependencies.voice_manager.list_voices()
         if available_voices:
             for voice_id in available_voices:
                 try:
                     voice_path = dependencies.voice_manager.get_voice_path(voice_id)
                     if voice_path:
-                        loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(None, dependencies.tts_engine.prepare_conditionals, voice_path)
-                        logger.info(f"Preloaded voice '{voice_id}' into cache.")
+                        # Warm up cache on all engines
+                        for engine in dependencies.tts_engine_manager.get_all_engines():
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(None, engine.prepare_conditionals, voice_path)
+                            log_prefix = f"GPU {engine.gpu_id}" if engine.device != "cpu" else "CPU"
+                            logger.info(f"Preloaded voice '{voice_id}' into cache for {log_prefix}.")
                     else:
                         logger.warning(f"Could not find path for voice ID '{voice_id}'. Skipping.")
                 except Exception as e:
@@ -103,7 +106,7 @@ def create_app() -> FastAPI:
         """
         Cleans up resources, like shutting down NVML.
         """
-        if hasattr(app.state, 'pynvml_handle') and app.state.pynvml_handle:
+        if getattr(app.state, 'pynvml_initialized', False):
             try:
                 import pynvml
                 pynvml.nvmlShutdown()
@@ -150,6 +153,10 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
+        # Skip logging for health and system status endpoints
+        if request.url.path in ["/health", "/system-status"]:
+            return await call_next(request)
+
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         request.state.request_id = request_id
 
@@ -180,18 +187,21 @@ def create_app() -> FastAPI:
         """
         Health check endpoint to verify the application is running and TTS engine status.
         """
-        tts_status = {"status": "ok"}
-        if dependencies.tts_engine:
-            tts_status = dependencies.tts_engine.get_initialization_status()
-            if tts_status["state"] == InitializationState.ERROR.value:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"TTS Engine Error: {tts_status['error']}")
-            elif tts_status["state"] != InitializationState.READY.value:
-                return JSONResponse(content={"status": "initializing", "tts_engine": tts_status}, status_code=status.HTTP_202_ACCEPTED)
+        if dependencies.tts_engine_manager:
+            tts_status = dependencies.tts_engine_manager.get_status()
+            # Check if any engine has an error
+            for gpu_id, status_info in tts_status.items():
+                if status_info["state"] == InitializationState.ERROR.value:
+                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"TTS Engine Error on {gpu_id}: {status_info['error']}")
+            # Check if all engines are ready
+            all_ready = all(s["state"] == InitializationState.READY.value for s in tts_status.values())
+            if not all_ready:
+                 return JSONResponse(content={"status": "initializing", "tts_engines": tts_status}, status_code=status.HTTP_202_ACCEPTED)
         else:
-            tts_status = {"state": InitializationState.NOT_STARTED.value, "progress": "TTS engine not yet instantiated", "error": None}
-            return JSONResponse(content={"status": "not_started", "tts_engine": tts_status}, status_code=status.HTTP_202_ACCEPTED)
+            tts_status = {"state": InitializationState.NOT_STARTED.value, "progress": "TTS engine manager not yet instantiated", "error": None}
+            return JSONResponse(content={"status": "not_started", "tts_engines": tts_status}, status_code=status.HTTP_202_ACCEPTED)
 
-        return {"status": "ok", "tts_engine": tts_status}
+        return {"status": "ok", "tts_engines": tts_status}
 
     @app.get("/system-status", dependencies=[Depends(get_api_key)])
     async def system_status(request: Request):
@@ -224,38 +234,41 @@ def create_app() -> FastAPI:
 
         # --- GPU Info ---
         gpus_data = []
-        try:
-            import pynvml
-            # pynvml is initialized at startup, so we can use it directly.
-            device_count = pynvml.nvmlDeviceGetCount()
-            if device_count == 0:
-                gpus_data = {"status": "not_available", "reason": "No NVIDIA GPUs detected."}
-            else:
-                for i in range(device_count):
-                    handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                    mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                    utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    gpu_info = {
-                        "device_id": i,
-                        "utilization_percent": {
-                            "gpu": utilization.gpu,
-                            "memory": utilization.memory
-                        },
-                        "memory_gb": {
-                            "total": round(mem_info.total / (1024**3), 2),
-                            "used": round(mem_info.used / (1024**3), 2),
-                            "free": round(mem_info.free / (1024**3), 2)
+        gpus_data = []
+        if not getattr(app.state, 'pynvml_initialized', False):
+            gpus_data = []
+        else:
+            try:
+                import pynvml
+                device_count = pynvml.nvmlDeviceGetCount()
+                if device_count == 0:
+                    gpus_data = []
+                else:
+                    for i in range(device_count):
+                        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                        gpu_info = {
+                            "device_id": i,
+                            "utilization_percent": {
+                                "gpu": utilization.gpu,
+                                "memory": utilization.memory
+                            },
+                            "memory_gb": {
+                                "total": round(mem_info.total / (1024**3), 2),
+                                "used": round(mem_info.used / (1024**3), 2),
+                                "free": round(mem_info.free / (1024**3), 2)
+                            }
                         }
-                    }
-                    gpus_data.append(gpu_info)
-        except pynvml.NVMLError as e:
-            logger.error(f"NVIDIA driver/library error during status check: {e}", exc_info=True)
-            gpus_data = {"error": f"Could not communicate with NVIDIA driver: {e}"}
-        except ImportError:
-            gpus_data = {"status": "not_available", "reason": "pynvml library not installed."}
-        except Exception as e:
-            logger.error(f"An unexpected error occurred while fetching GPU status: {e}", exc_info=True)
-            gpus_data = {"error": f"An unexpected error occurred: {e}"}
+                        gpus_data.append(gpu_info)
+            except pynvml.NVMLError as e:
+                logger.error(f"NVIDIA driver/library error during status check: {e}", exc_info=True)
+                gpus_data = []
+            except ImportError:
+                gpus_data = []
+            except Exception as e:
+                logger.error(f"An unexpected error occurred while fetching GPU status: {e}", exc_info=True)
+                gpus_data = []
 
 
         return {"cpu": cpu_data, "gpus": gpus_data}
@@ -314,12 +327,13 @@ def create_app() -> FastAPI:
     @app.api_route("/tts/generate", methods=["GET", "POST"], dependencies=[Depends(get_api_key)])
     async def tts_generate(
         request: Request,
-        tts_engine: TextToSpeechEngine = Depends(get_tts_engine)
+        tts_engine_manager: TTSEngineManager = Depends(get_tts_engine_manager)
     ):
         """
         Generates and streams audio for the given text.
         Accepts both GET and POST requests.
         """
+        tts_engine = await tts_engine_manager.get_engine()
         if request.method == "POST":
             try:
                 body = await request.json()
@@ -401,7 +415,7 @@ def create_app() -> FastAPI:
     async def upload_voice(
         file: UploadFile = File(...),
         voice_manager: VoiceManager = Depends(get_voice_manager),
-        tts_engine: TextToSpeechEngine = Depends(get_tts_engine)
+        tts_engine_manager: TTSEngineManager = Depends(get_tts_engine_manager)
     ):
         """
         Upload a new voice file.
@@ -409,7 +423,9 @@ def create_app() -> FastAPI:
         try:
             contents = await file.read()
             voice_manager.save_voice(file.filename, contents)
-            tts_engine.clear_voice_cache(file.filename)  # Invalidate cache
+            # Invalidate cache on all engines
+            for engine in tts_engine_manager.get_all_engines():
+                engine.clear_voice_cache(file.filename)
             return JSONResponse(content={"voice_id": file.filename, "message": "Voice uploaded successfully."}, status_code=201)
         except FileExistsError as e:
             raise HTTPException(status_code=409, detail=str(e))
@@ -428,14 +444,16 @@ def create_app() -> FastAPI:
     async def delete_voice(
         voice_id: str,
         voice_manager: VoiceManager = Depends(get_voice_manager),
-        tts_engine: TextToSpeechEngine = Depends(get_tts_engine)
+        tts_engine_manager: TTSEngineManager = Depends(get_tts_engine_manager)
     ):
         """
         Delete a specific voice by its ID.
         """
         try:
             voice_manager.delete_voice(voice_id)
-            tts_engine.clear_voice_cache(voice_id)  # Invalidate cache
+            # Invalidate cache on all engines
+            for engine in tts_engine_manager.get_all_engines():
+                engine.clear_voice_cache(voice_id)
             return JSONResponse(content={"message": f"Voice '{voice_id}' deleted successfully."})
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail=f"Voice '{voice_id}' not found.")
