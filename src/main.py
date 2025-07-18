@@ -21,6 +21,7 @@ import logging
 import time
 from typing import Optional
 import asyncio
+import uuid
 
 from .config import settings, tts_config
 from .dependencies import get_tts_engine, get_voice_manager
@@ -133,10 +134,19 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request.state.request_id = request_id
+
         start_time = time.time()
         response = await call_next(request)
         duration = time.time() - start_time
-        logger.info(f"Handled request: {request.method} {request.url.path} - Status: {response.status_code} - Duration: {duration:.4f}s")
+
+        logger.info(
+            f'[{request_id}] Handled request: {request.method} {request.url.path} - '
+            f'Status: {response.status_code} - Duration: {duration:.4f}s'
+        )
+
+        response.headers["X-Request-ID"] = request_id
         if request.url.path.startswith("/static"):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             response.headers["Pragma"] = "no-cache"
@@ -296,18 +306,27 @@ def create_app() -> FastAPI:
                 return JSONResponse(content={"error": "Invalid JSON body"}, status_code=400)
         else:  # GET request
             query_params = request.query_params
+            def get_param(name, default, cast_func):
+                val = query_params.get(name)
+                if val is None or val == '':
+                    return default
+                try:
+                    return cast_func(val)
+                except (ValueError, TypeError):
+                    return default
+
             tts_request = TTSRequest(
                 text=query_params.get("text"),
                 voice_id=query_params.get("voice_id"),
                 format=query_params.get("format"),
-                cfg_guidance_weight=float(query_params.get("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT)),
-                synthesis_temperature=float(query_params.get("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE)),
-                text_processing_chunk_size=int(query_params.get("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE)),
-                audio_tokens_per_slice=int(query_params.get("audio_tokens_per_slice", tts_config.AUDIO_TOKENS_PER_SLICE)),
-                remove_trailing_milliseconds=int(query_params.get("remove_trailing_milliseconds", tts_config.REMOVE_TRAILING_MILLISECONDS)),
-                remove_leading_milliseconds=int(query_params.get("remove_leading_milliseconds", tts_config.REMOVE_LEADING_MILLISECONDS)),
-                chunk_overlap_strategy=query_params.get("chunk_overlap_strategy", tts_config.CHUNK_OVERLAP_STRATEGY),
-                crossfade_duration_milliseconds=int(query_params.get("crossfade_duration_milliseconds", tts_config.CROSSFADE_DURATION_MILLISECONDS)),
+                cfg_guidance_weight=get_param("cfg_guidance_weight", tts_config.CFG_GUIDANCE_WEIGHT, float),
+                synthesis_temperature=get_param("synthesis_temperature", tts_config.SYNTHESIS_TEMPERATURE, float),
+                text_processing_chunk_size=get_param("text_processing_chunk_size", tts_config.TEXT_PROCESSING_CHUNK_SIZE, int),
+                audio_tokens_per_slice=get_param("audio_tokens_per_slice", tts_config.AUDIO_TOKENS_PER_SLICE, int),
+                remove_trailing_milliseconds=get_param("remove_trailing_milliseconds", tts_config.REMOVE_TRAILING_MILLISECONDS, int),
+                remove_leading_milliseconds=get_param("remove_leading_milliseconds", tts_config.REMOVE_LEADING_MILLISECONDS, int),
+                chunk_overlap_strategy=get_param("chunk_overlap_strategy", tts_config.CHUNK_OVERLAP_STRATEGY, str),
+                crossfade_duration_milliseconds=get_param("crossfade_duration_milliseconds", tts_config.CROSSFADE_DURATION_MILLISECONDS, int),
             )
 
         if not tts_request.text:
@@ -317,7 +336,8 @@ def create_app() -> FastAPI:
         output_format, media_type = get_output_format_and_media_type(accept_header, tts_request.format)
 
         try:
-            logger.info(f"Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format})")
+            request_id = request.state.request_id
+            logger.info(f"[{request_id}] Received TTS request for voice_id: {tts_request.voice_id} (format: {output_format})")
             start_time = time.time()
             audio_stream = tts_engine.stream(
                 text=tts_request.text,
@@ -331,11 +351,12 @@ def create_app() -> FastAPI:
                 remove_leading_milliseconds=tts_request.remove_leading_milliseconds,
                 chunk_overlap_strategy=tts_request.chunk_overlap_strategy,
                 crossfade_duration_milliseconds=tts_request.crossfade_duration_milliseconds,
-                start_time=start_time
+                start_time=start_time,
+                request_id=request_id
             )
             return StreamingResponse(audio_stream, media_type=media_type)
         except Exception as e:
-            logger.error(f"TTS generation failed: {e}", exc_info=True)
+            logger.error(f"[{request.state.request_id}] TTS generation failed: {e}", exc_info=True)
             return JSONResponse(content={"error": "Internal server error"}, status_code=500)
 
 
