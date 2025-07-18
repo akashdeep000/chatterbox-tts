@@ -503,9 +503,11 @@ class TextToSpeechEngine:
                     speech_tokens_for_inference = token_chunk
 
                 # 1. Prepare tokens for S3Gen
-                if is_last_slice:
-                    speech_tokens_for_inference = torch.cat([speech_tokens_for_inference, eos_token], dim=1)
+                if is_last_slice: # Apply EOS token at the end of each text chunk's last slice
+                    speech_tokens_with_eos = torch.cat([speech_tokens_for_inference, eos_token], dim=1)
+                    speech_tokens_for_inference = speech_tokens_with_eos[0]
 
+                # with token filtering and were not necessary for the current streaming logic.
                 speech_tokens_for_inference = drop_invalid_tokens(speech_tokens_for_inference)
                 speech_tokens_for_inference = speech_tokens_for_inference[speech_tokens_for_inference < 6561]
 
