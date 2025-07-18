@@ -327,7 +327,8 @@ class TextToSpeechEngine:
         text_chunks: list,
         speech_token_queue: asyncio.Queue,
         params: SynthesisParams,
-        stream: torch.cuda.Stream,
+        t3_stream: torch.cuda.Stream,
+        s3gen_stream: torch.cuda.Stream,
     ):
         """Producer task for T3 model. Generates speech tokens and puts them into a queue."""
         num_chunks = len(text_chunks)
@@ -363,7 +364,7 @@ class TextToSpeechEngine:
                     text_tokens,
                     params.synthesis_temperature,
                     params.cfg_guidance_weight,
-                    stream,
+                    t3_stream,
                 )
                 t3_inference_time = time.time() - t3_start_time
                 log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
@@ -396,8 +397,12 @@ class TextToSpeechEngine:
                         predicted_tokens = torch.cat(slice_to_send, dim=1)  # shape: (B, num_tokens)
                         slice_idx += 1
                         is_first_slice = (slice_idx == 1)
+                        # Record an event on the T3 stream after the slice is produced
+                        event = torch.cuda.Event()
+                        event.record(t3_stream)
+
                         await speech_token_queue.put(
-                            (predicted_tokens, i + 1, slice_idx, is_first_slice, False, is_first_text_chunk, is_last_text_chunk)
+                            (predicted_tokens, i + 1, slice_idx, is_first_slice, False, is_first_text_chunk, is_last_text_chunk, event)
                         )
                     elif generator_exhausted and current_slice:
                         # If no more tokens are coming, send full current_slice to queue
@@ -405,8 +410,12 @@ class TextToSpeechEngine:
                         is_first_slice = (slice_idx == 1)
                         # Concatenate all predicted tokens along the sequence dimension.
                         predicted_tokens = torch.cat(current_slice, dim=1)  # shape: (B, num_tokens)
+                        # Record an event on the T3 stream for the final slice
+                        event = torch.cuda.Event()
+                        event.record(t3_stream)
+
                         await speech_token_queue.put(
-                            (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk) # shape: (B, num_tokens)
+                            (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk, event) # shape: (B, num_tokens)
                         )
                         current_slice = [] # Clear current_slice after sending
                         break # All tokens sent for this chunk
@@ -429,7 +438,7 @@ class TextToSpeechEngine:
         speech_token_queue: asyncio.Queue,
         pcm_chunk_queue: asyncio.Queue,
         params: SynthesisParams,
-        stream: torch.cuda.Stream,
+        s3gen_stream: torch.cuda.Stream,
     ):
         """Consumer task for S3Gen model. Converts speech tokens to audio chunks."""
         loop = params.loop
@@ -439,6 +448,7 @@ class TextToSpeechEngine:
         eos_token = torch.tensor([self.tts.t3.hp.stop_text_token]).unsqueeze(0).to(self.device)
         previous_audio_chunk = None  # Stores the remainder of the last processed chunk for the next cross-fade
         is_first_audio_chunk_sent = False # Flag to track if the very first audio chunk has been sent
+        previous_length = 0 # Tracks audio length for 'full' overlap strategy
 
         try:
             while True:
@@ -448,7 +458,10 @@ class TextToSpeechEngine:
                     # The last chunk should have already been sent by the main loop.
                     break
 
-                token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk = queue_item
+                token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk, event = queue_item
+
+                # Wait for the T3 slice to be ready before processing with S3Gen
+                s3gen_stream.wait_event(event)
                 log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
                 log.info(
                     f"{log_prefix}[{params.request_id}] S3Gen: Starting inference for slice {slice_num} "
@@ -459,6 +472,7 @@ class TextToSpeechEngine:
                     current_text_chunk_accumulated_tokens = None # Reset for new text chunk
                     cache_source = torch.zeros(1, 1, 0).to(self.device) # Reset cache_source for new text chunk
                     last_text_chunk_num = text_chunk_num
+                    previous_length = 0 # Reset for new text chunk
 
                 # 1. Prepare tokens for S3Gen based on overlap method
                 if params.chunk_overlap_strategy == "full":
@@ -505,18 +519,24 @@ class TextToSpeechEngine:
                     **inference_kwargs
                 )
                 s3gen_start_time = time.time()
-                with torch.cuda.stream(stream):
+                with torch.cuda.stream(s3gen_stream):
                     wav, new_cache_source = await loop.run_in_executor(None, partial_inference)
                 s3gen_inference_time = time.time() - s3gen_start_time
                 log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
                 log.info(f"{log_prefix}[{params.request_id}] S3Gen: Inference for slice {slice_num} took {s3gen_inference_time:.4f}s")
                 current_audio_chunk = wav.squeeze(0).detach()
 
+                # 3. Post-processing based on overlap method
                 if params.chunk_overlap_strategy == "full":
                     # Update the cache_source for the next iteration
                     cache_source = new_cache_source
+                    # Trim the repeated audio from the beginning of the chunk
+                    new_audio_length = current_audio_chunk.shape[0]
+                    if not is_first_slice:
+                        current_audio_chunk = current_audio_chunk[previous_length:]
+                    previous_length = new_audio_length
 
-                # 3. Audio Processing (Trimming, Crossfading)
+                # 4. Audio Processing (Trimming, Crossfading)
                 # Calculate samples to remove based on milliseconds
                 leading_samples_to_remove = (params.remove_leading_milliseconds * self.sr) // 1000
                 trailing_samples_to_remove = (params.remove_trailing_milliseconds * self.sr) // 1000
@@ -582,7 +602,7 @@ class TextToSpeechEngine:
                     previous_audio_chunk = None # Reset for the next text chunk
 
 
-                # 4. Queue the processed audio chunk for output
+                # 5. Queue the processed audio chunk for output
                 if chunk_to_send is not None and chunk_to_send.shape[0] > 0:
                     pcm_data = await self.audio_processor.to_pcm(chunk_to_send, loop)
                     await pcm_chunk_queue.put(pcm_data)
@@ -641,10 +661,11 @@ class TextToSpeechEngine:
             yield b''
             return
 
-        # 3. Setup Queues and CUDA Stream
+        # 3. Setup Queues and CUDA Streams
         speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
         pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
-        stream = torch.cuda.Stream() if self.device.startswith('cuda') else None
+        t3_stream = torch.cuda.Stream() if self.device.startswith('cuda') else None
+        s3gen_stream = torch.cuda.Stream() if self.device.startswith('cuda') else None
 
         # 4. Create Synthesis Parameters
         synthesis_params = SynthesisParams(
@@ -665,10 +686,10 @@ class TextToSpeechEngine:
 
         # 5. Start Producer and Consumer Tasks
         producer_task = asyncio.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, synthesis_params, stream)
+            self._t3_producer_task(text_chunks, speech_token_queue, synthesis_params, t3_stream, s3gen_stream)
         )
         consumer_task = asyncio.create_task(
-            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, synthesis_params, stream)
+            self._s3gen_consumer_task(speech_token_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
         )
 
         # 6. Setup Audio Encoder
