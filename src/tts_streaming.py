@@ -155,9 +155,9 @@ class TextToSpeechEngine:
         self._initialization_state: InitializationState = InitializationState.NOT_STARTED
         self._initialization_progress: str = ""
         self._initialization_error: Optional[str] = None
-        self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_GPU)
+        self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_WORKER)
         self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=settings.CONCURRENT_REQUESTS_PER_GPU
+            max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
         )
 
     async def ainit(self):
@@ -412,7 +412,7 @@ class TextToSpeechEngine:
                         event = torch.cuda.Event() if t3_stream else None
                         if event:
                             event.record(t3_stream)
-
+                        log.debug(f"Sending {predicted_tokens.shape[1]} tokens to queue. (slice {slice_idx})")
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, False, is_first_text_chunk, is_last_text_chunk, event)
                         )
@@ -426,7 +426,7 @@ class TextToSpeechEngine:
                         event = torch.cuda.Event() if t3_stream else None
                         if event:
                             event.record(t3_stream)
-
+                        log.debug(f"Sending {predicted_tokens.shape[1]} tokens to queue. (slice {slice_idx})")
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk, event)
                         )
@@ -497,7 +497,7 @@ class TextToSpeechEngine:
                 speech_tokens_for_inference = speech_tokens_for_inference[speech_tokens_for_inference < 6561]
 
                 if speech_tokens_for_inference.shape[-1] == 0:
-                    log.warning(f"[{params.request_id}] Skipping a slice because it contained no valid tokens after filtering.")
+                    log.debug(f"[{params.request_id}] Skipping a slice because it contained no valid tokens after filtering.")
                     speech_token_queue.task_done()
                     continue
 

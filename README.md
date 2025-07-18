@@ -73,7 +73,7 @@ Configuration is managed via environment variables. You can set them in your she
 | `PORT`                        | The port for the application server.                                                                    | `8000`               |
 | `DEBUG`                       | Enable debug mode. **Forces worker count to 1.**                                                        | `False`              |
 | `LOG_LEVEL`                   | The logging level (e.g., `INFO`, `DEBUG`).                                                              | `INFO`               |
-| `CONCURRENT_REQUESTS_PER_GPU` | Maximum number of concurrent TTS requests to process per GPU.                                           | `1`                  |
+| `CONCURRENT_REQUESTS_PER_WORKER` | Maximum number of concurrent TTS requests to process per GPU.                                           | `1`                  |
 | `VOICES_DIR`                  | Directory where custom voices are stored.                                                               | `/app/voices/`            |
 | `PRELOADED_VOICES_DIR`        | Directory for preloaded voices.                                                                         | `/app/preloaded-voices/`  |
 | `MODEL_PATH`                  | Path to the directory containing TTS models.                                                            | `models`             |
@@ -102,7 +102,7 @@ These parameters control the TTS engine's behavior and can be set via environmen
 ```
 # Server Settings
 API_KEY="your-super-secret-api-key"
-CONCURRENT_REQUESTS_PER_GPU=2 # Allow 2 TTS tasks per GPU
+CONCURRENT_REQUESTS_PER_WORKER=2 # Allow 2 TTS tasks per GPU
 
 # TTS Tuning for Low Latency
 TTS_SPEECH_TOKEN_QUEUE_MAX_SIZE=2
