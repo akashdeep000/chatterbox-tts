@@ -22,6 +22,7 @@ import time
 from typing import Optional
 import asyncio
 import uuid
+import multiprocessing
 
 from .config import settings, tts_config
 from .dependencies import get_tts_engine, get_voice_manager
@@ -33,6 +34,9 @@ from fastapi import File, UploadFile
 # Configure logging
 logging.basicConfig(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+# A shared counter to assign a unique ID to each worker process
+worker_id_counter = multiprocessing.Value('i', -1)
 
 def create_app() -> FastAPI:
     """
@@ -46,22 +50,28 @@ def create_app() -> FastAPI:
         """
         Initializes the TTS engine, Voice Manager, and NVML for GPU monitoring.
         """
+        # --- Assign a unique ID to this worker ---
+        with worker_id_counter.get_lock():
+            worker_id_counter.value += 1
+            worker_id = worker_id_counter.value
+
         # --- NVML Initialization ---
         try:
             import pynvml
             pynvml.nvmlInit()
-            app.state.pynvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            logger.info("pynvml initialized successfully for GPU monitoring.")
+            # Each worker now gets a handle to its specific GPU
+            app.state.pynvml_handle = pynvml.nvmlDeviceGetHandleByIndex(worker_id)
+            logger.info(f"[Worker {worker_id}] pynvml initialized successfully for GPU {worker_id}.")
         except Exception as e:
             app.state.pynvml_handle = None
-            logger.warning(f"Could not initialize pynvml. GPU status will not be available. Error: {e}")
+            logger.warning(f"[Worker {worker_id}] Could not initialize pynvml. GPU status will not be available. Error: {e}")
 
         # --- TTS Engine and Voice Manager Initialization ---
-        logger.info("Initializing TTS engine and Voice Manager...")
-        dependencies.tts_engine = TextToSpeechEngine()
+        logger.info(f"[Worker {worker_id}] Initializing TTS engine and Voice Manager...")
+        dependencies.tts_engine = TextToSpeechEngine(worker_id=worker_id)
         dependencies.voice_manager = VoiceManager()
         await dependencies.tts_engine.ainit() # Call the async initialization method
-        logger.info("TTS engine and Voice Manager initialized successfully.")
+        logger.info(f"[Worker {worker_id}] TTS engine and Voice Manager initialized successfully.")
 
         # --- Voice Cache Warm-up ---
         logger.info("Warming up voice cache...")
