@@ -412,7 +412,7 @@ class TextToSpeechEngine:
                         event = torch.cuda.Event() if t3_stream else None
                         if event:
                             event.record(t3_stream)
-                        log.debug(f"Sending {predicted_tokens.shape[1]} tokens to queue. (slice {slice_idx})")
+                        log.debug(f"Sending slice {slice_idx} - {predicted_tokens.shape[1]} tokens to queue. (from text chunk {i+1}/{num_chunks})")
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, False, is_first_text_chunk, is_last_text_chunk, event)
                         )
@@ -426,7 +426,7 @@ class TextToSpeechEngine:
                         event = torch.cuda.Event() if t3_stream else None
                         if event:
                             event.record(t3_stream)
-                        log.debug(f"Sending {predicted_tokens.shape[1]} tokens to queue. (slice {slice_idx})")
+                        log.debug(f"Sending slice {slice_idx} - {predicted_tokens.shape[1]} tokens to queue. (from text chunk {i+1}/{num_chunks})")
                         await speech_token_queue.put(
                             (predicted_tokens, i + 1, slice_idx, is_first_slice, True, is_first_text_chunk, is_last_text_chunk, event)
                         )
@@ -467,6 +467,9 @@ class TextToSpeechEngine:
             while True:
                 queue_item = await speech_token_queue.get()
                 if queue_item is None:
+                    if previous_audio_chunk is not None:
+                        # If there's still audio in the queue, queue it as the final chunk
+                        await gpu_audio_queue.put((previous_audio_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk))
                     break
 
                 token_chunk, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk, event = queue_item
@@ -563,7 +566,7 @@ class TextToSpeechEngine:
 
                 # 7. Queue the final tensor for PCM conversion
                 if chunk_to_send is not None and chunk_to_send.numel() > 0:
-                    await gpu_audio_queue.put(chunk_to_send)
+                    await gpu_audio_queue.put((chunk_to_send, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk))
 
                 speech_token_queue.task_done()
 
@@ -582,11 +585,13 @@ class TextToSpeechEngine:
         loop = params.loop
         try:
             while True:
-                audio_tensor = await gpu_audio_queue.get()
-                if audio_tensor is None:
+                queue_item = await gpu_audio_queue.get()
+                if queue_item is None:
                     break
-
+                audio_tensor, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk = queue_item
+                start_time = time.time()
                 pcm_data = await self.audio_processor.to_pcm(audio_tensor, loop, self.pcm_conversion_executor)
+                log.info(f"[{params.request_id}] PCM conversion for slice {slice_num} (from text chunk {text_chunk_num}/{params.text_chunk_count}) took {time.time() - start_time:.4f}s")
                 await pcm_chunk_queue.put(pcm_data)
 
         except Exception as e:
