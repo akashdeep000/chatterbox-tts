@@ -217,13 +217,18 @@ class TextToSpeechEngine:
             self._initialization_progress = "Loading TTS model (this may take a while)..."
             # Initialize model with run_in_executor for non-blocking
             loop = asyncio.get_event_loop()
-            self.tts = await loop.run_in_executor(
-                None,
-                lambda: OriginalChatterboxTTS.from_local(
+            self.tts = OriginalChatterboxTTS.from_local(
                     settings.MODEL_PATH,
                     device=self.device
                 )
-            )
+
+            self._initialization_progress = "Compiling model (this may take a few minutes)..."
+            log.info(f"{log_prefix} Compiling model...")
+            start_time = time.time()
+            self.tts.t3.inference_stream = torch.compile(self.tts.t3.inference_stream, mode="reduce-overhead", fullgraph=True)
+            compilation_time = time.time() - start_time
+            log.info(f"{log_prefix} Model compiled in {compilation_time:.2f} seconds.")
+
             self.sr = self.tts.sr # Set sample rate from the loaded model
 
             self._initialization_state = InitializationState.READY
