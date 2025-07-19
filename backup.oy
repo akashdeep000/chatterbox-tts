@@ -110,25 +110,25 @@ class SynthesisParams:
     request_id: str
 
 
+def _blocking_pcm_conversion(audio_tensor: torch.Tensor) -> bytes:
+    """Synchronous, CPU-bound audio conversion logic."""
+    audio_tensor_clamped = torch.clamp(audio_tensor.cpu(), -1.0, 1.0)
+    audio_tensor_int = (audio_tensor_clamped * 32767).to(torch.int16)
+    pcm_data = audio_tensor_int.numpy().tobytes()
+    safe_delete_tensors(audio_tensor, audio_tensor_clamped, audio_tensor_int)
+    return pcm_data
+
+
 class _AudioProcessor:
     """Handles audio processing tasks like WAV header creation and PCM conversion."""
 
     @staticmethod
-    async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop, executor: concurrent.futures.ThreadPoolExecutor) -> bytes:
+    async def to_pcm(audio_tensor: torch.Tensor, loop: asyncio.AbstractEventLoop, executor: concurrent.futures.ProcessPoolExecutor) -> bytes:
         """
         Converts an audio tensor to PCM byte data asynchronously to avoid blocking.
-        The tensor is moved to the CPU and converted inside a dedicated thread pool executor.
+        The tensor is moved to the CPU and converted inside a dedicated process pool executor.
         """
-        def _blocking_conversion():
-            """The synchronous part of the conversion."""
-            audio_tensor_clamped = torch.clamp(audio_tensor.cpu(), -1.0, 1.0)
-            audio_tensor_int = (audio_tensor_clamped * 32767).to(torch.int16)
-            pcm_data = audio_tensor_int.numpy().tobytes()
-            safe_delete_tensors(audio_tensor, audio_tensor_clamped, audio_tensor_int)
-            return pcm_data
-
-        # Offload the blocking CPU operations to the dedicated executor
-        return await loop.run_in_executor(executor, _blocking_conversion)
+        return await loop.run_in_executor(executor, _blocking_pcm_conversion, audio_tensor)
 
 
 class TextToSpeechEngine:
@@ -157,10 +157,10 @@ class TextToSpeechEngine:
         self._initialization_progress: str = ""
         self._initialization_error: Optional[str] = None
         self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(
+        self.pcm_conversion_executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
         )
-        self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(
+        self.text_processing_executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
         )
 
@@ -745,6 +745,7 @@ class TextToSpeechEngine:
                 log.debug(f"{log_prefix} Waited for PCM chunk for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 if chunk is None:
                     log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
+                    pcm_chunk_queue.task_done()
                     break
                 yield chunk
                 pcm_chunk_queue.task_done()

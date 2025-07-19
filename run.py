@@ -1,20 +1,17 @@
 import uvicorn
+import subprocess
+import sys
 from src.config import settings
+import os
+from pathlib import Path
 
 if __name__ == "__main__":
-    """
-    This script provides a convenient way to run the application for local development.
-
-    It launches the Uvicorn server with the correct application path and enables --reload,
-    which automatically restarts the server when code changes are detected.
-
-    To run the application, execute this command from the project root:
-    python run.py
-    """
     uvicorn.run(
-        "src.main:app",
+        "src.main:create_app",
+        factory=True,
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
+        workers=1,
         log_level=settings.LOG_LEVEL.lower()
     )

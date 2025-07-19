@@ -50,6 +50,11 @@ class AppConfig(BaseSettings):
         description="List of allowed origins for CORS. Use '*' to allow all origins."
     )
 
+    CONCURRENT_REQUESTS_PER_WORKER: int = Field(
+        default=1,
+        description="Maximum number of concurrent TTS requests to process per GPU or CPU."
+    )
+
     class Config:
         # Load from a .env file if it exists
         env_file = ".env"
@@ -110,12 +115,12 @@ class TTSConfig(BaseSettings):
 
     # Queue sizes for streaming
     SPEECH_TOKEN_QUEUE_MAX_SIZE: int = Field(
-        default=20,
-        description="Maximum size of the speech token queue used in streaming."
+        default=2,
+        description="Maximum size of the speech token queue used in streaming. Smaller values reduce initial latency."
     )
     PCM_CHUNK_QUEUE_MAX_SIZE: int = Field(
-        default=10,
-        description="Maximum size of the PCM chunk queue used in streaming."
+        default=3,
+        description="Maximum size of the PCM chunk queue used in streaming. Smaller values reduce initial latency but may increase risk of stuttering."
     )
 
 # Instantiate the config objects to be used across the application
