@@ -19,6 +19,7 @@ import functools
 from enum import Enum
 import random
 import concurrent.futures
+import contextlib
 
 from .audio_encoding import AudioEncoder
 
@@ -157,6 +158,9 @@ class TextToSpeechEngine:
         self._initialization_error: Optional[str] = None
         self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_WORKER)
         self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
+        )
+        self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
         )
 
@@ -449,6 +453,15 @@ class TextToSpeechEngine:
             log.info(f"{log_prefix} Finished. Signaling end of production.")
             await speech_token_queue.put(None) # Signal end of production
 
+    def _blocking_s3gen_inference(self, speech_tokens_for_inference, ref_dict, cache_source, s3gen_stream):
+        """Synchronous helper for S3Gen inference."""
+        with torch.cuda.stream(s3gen_stream) if s3gen_stream else contextlib.nullcontext():
+            return self.tts.s3gen.inference(
+                speech_tokens=speech_tokens_for_inference,
+                ref_dict=ref_dict,
+                cache_source=cache_source
+            )
+
     async def _s3gen_producer_task(
         self,
         speech_token_queue: asyncio.Queue,
@@ -517,14 +530,15 @@ class TextToSpeechEngine:
                     speech_tokens_for_inference = F.pad(speech_tokens_for_inference, (0, padding_needed), "constant", 0)
 
                 # 2. S3Gen Inference
-                inference_kwargs = {"speech_tokens": speech_tokens_for_inference, "ref_dict": params.conds.gen}
-                if params.chunk_overlap_strategy == "full":
-                    inference_kwargs["cache_source"] = cache_source
-
-                partial_inference = functools.partial(self.tts.s3gen.inference, **inference_kwargs)
                 s3gen_start_time = time.time()
-                with torch.cuda.stream(s3gen_stream):
-                    wav, new_cache_source = await loop.run_in_executor(None, partial_inference)
+                wav, new_cache_source = await loop.run_in_executor(
+                    None,
+                    self._blocking_s3gen_inference,
+                    speech_tokens_for_inference,
+                    params.conds.gen,
+                    cache_source,
+                    s3gen_stream
+                )
                 s3gen_inference_time = time.time() - s3gen_start_time
                 log.info(f"{log_prefix} Inference for slice {slice_num} took {s3gen_inference_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 current_audio_chunk = wav.squeeze(0).detach()
@@ -665,7 +679,12 @@ class TextToSpeechEngine:
         conds = await self._prepare_and_get_conds(audio_prompt_path, voice_exaggeration_factor, loop, request_id)
 
         # 2. Text Processing
-        text_chunks = split_text_into_chunks(text, text_processing_chunk_size)
+        text_chunks = await loop.run_in_executor(
+            self.text_processing_executor,
+            split_text_into_chunks,
+            text,
+            text_processing_chunk_size
+        )
         if not text_chunks:
             yield b''
             return
@@ -725,6 +744,7 @@ class TextToSpeechEngine:
                 wait_time = time.time() - start_time
                 log.debug(f"{log_prefix} Waited for PCM chunk for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 if chunk is None:
+                    log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
                     break
                 yield chunk
                 pcm_chunk_queue.task_done()
@@ -740,6 +760,7 @@ class TextToSpeechEngine:
                 yield audio_chunk
         finally:
             # Cleanup: Cancel tasks and clear tensors
+            log.info(f"{log_prefix} Cleaning up...")
             tasks = [t3_producer, s3gen_producer, pcm_consumer]
             for task in tasks:
                 task.cancel()
@@ -747,6 +768,13 @@ class TextToSpeechEngine:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    # def shutdown(self):
+    #     """Shuts down the executors."""
+    #     log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
+    #     log.info(f"{log_prefix} Shutting down executors...")
+    #     self.pcm_conversion_executor.shutdown(wait=True)
+    #     self.text_processing_executor.shutdown(wait=True)
 
 
 class TTSEngineManager:
