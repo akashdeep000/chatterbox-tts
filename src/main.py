@@ -108,6 +108,11 @@ def create_app() -> FastAPI:
             except Exception as e:
                 logger.error(f"Error shutting down pynvml: {e}")
 
+        if dependencies.tts_engine_manager:
+            logger.info("Shutting down TTS Engine Manager...")
+            dependencies.tts_engine_manager.shutdown()
+            logger.info("TTS Engine Manager shut down successfully.")
+
 
     # --- Static Files ---
     app.mount("/static", StaticFiles(directory="static"), name="static")

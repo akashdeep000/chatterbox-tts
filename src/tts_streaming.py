@@ -21,9 +21,6 @@ import random
 import concurrent.futures
 import contextlib
 
-from .audio_encoding import AudioEncoder
-
-
 class InitializationState(Enum):
     """Represents the initialization state of the TTS engine."""
     NOT_STARTED = "not_started"
@@ -38,8 +35,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-# Local application/library specific imports
-from .utils import safe_delete_tensors
 from chatterbox.models.t3 import T3
 from chatterbox.models.s3tokenizer import S3_SR, drop_invalid_tokens
 from chatterbox.models.s3gen import S3GEN_SR, S3Gen
@@ -48,33 +43,47 @@ from chatterbox.models.voice_encoder import VoiceEncoder
 from chatterbox.models.t3.modules.cond_enc import T3Cond
 from chatterbox.tts import ChatterboxTTS as OriginalChatterboxTTS
 
-from .config import settings, tts_config
-from .voice_manager import VoiceManager
-from .text_processing import split_text_into_chunks
-from .logging_config import log
+# Local application/library specific imports
+from src.utils import safe_delete_tensors
+from src.config import settings, tts_config
+from src.voice_manager import VoiceManager
+from src.text_processing import split_text_into_chunks
+from src.logging_config import log
+from .audio_encoding import AudioEncoder
 
 
-async def async_generator_wrapper(sync_generator: Generator):
+async def async_generator_wrapper(sync_generator: Generator, batch_size: int = 32):
     """
     Wraps a synchronous generator to make it asynchronously iterable.
-    Each item is yielded using asyncio.to_thread to prevent blocking the event loop.
+    Items are fetched in batches using asyncio.to_thread to reduce overhead and prevent blocking.
     """
     _END_OF_GENERATOR = object() # Local sentinel to signal generator exhaustion
 
-    def _get_next_item_safe():
-        """Synchronous helper to get the next item or signal exhaustion."""
+    def _get_next_batch_safe():
+        """Synchronous helper to get the next batch of items or signal exhaustion."""
+        batch = []
         try:
-            return next(sync_generator)
+            for _ in range(batch_size):
+                batch.append(next(sync_generator))
         except StopIteration:
+            # This is expected when the generator is exhausted.
+            # The batch might contain some remaining items.
+            pass
+
+        if not batch:
             return _END_OF_GENERATOR
+        return batch
 
     loop = asyncio.get_running_loop()
     while True:
         # Run the synchronous helper in a separate thread to avoid blocking the event loop
-        item = await loop.run_in_executor(None, _get_next_item_safe)
-        if item is _END_OF_GENERATOR:
+        item_batch = await loop.run_in_executor(None, _get_next_batch_safe)
+        if item_batch is _END_OF_GENERATOR:
             break
-        yield item
+
+        # Yield each item from the fetched batch
+        for item in item_batch:
+            yield item
 
 
 @dataclass
@@ -121,7 +130,7 @@ class _AudioProcessor:
         """
         def _blocking_conversion():
             """The synchronous part of the conversion."""
-            audio_tensor_clamped = torch.clamp(audio_tensor.cpu(), -1.0, 1.0)
+            audio_tensor_clamped = torch.clamp(audio_tensor, -1.0, 1.0).cpu()
             audio_tensor_int = (audio_tensor_clamped * 32767).to(torch.int16)
             pcm_data = audio_tensor_int.numpy().tobytes()
             safe_delete_tensors(audio_tensor, audio_tensor_clamped, audio_tensor_int)
@@ -163,6 +172,20 @@ class TextToSpeechEngine:
         self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
         )
+        self.text_tokenization_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
+        )
+        self.fade_in_curve = None
+        self.fade_out_curve = None
+
+    def shutdown(self):
+        """Gracefully shuts down the thread and process pools."""
+        log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
+        log.info(f"{log_prefix} Shutting down executors...")
+        self.pcm_conversion_executor.shutdown(wait=True)
+        self.text_processing_executor.shutdown(wait=True)
+        self.text_tokenization_executor.shutdown(wait=True)
+        log.info(f"{log_prefix} Executors shut down.")
 
     async def ainit(self):
         """
@@ -362,10 +385,15 @@ class TextToSpeechEngine:
                 is_last_text_chunk = (i == num_chunks - 1)
 
                 log.info(f"{log_prefix} Processing text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                # 1. Text to Tokens
+                # 1. Text to Tokens (using ThreadPoolExecutor for stability)
                 text_tokens = await loop.run_in_executor(
-                    None, self.tts.tokenizer.text_to_tokens, chunk
+                    self.text_tokenization_executor, self.tts.tokenizer.text_to_tokens, chunk
                 )
+                is_first_text_chunk = (i == 0)
+                is_last_text_chunk = (i == num_chunks - 1)
+
+                log.info(f"{log_prefix} Processing tokenized chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+
                 # Move text_tokens to the correct device
                 text_tokens = text_tokens.to(self.device)
 
@@ -395,7 +423,7 @@ class TextToSpeechEngine:
                 # Define the look-ahead buffer size (20% of audio_tokens_per_slice or 10 tokens, whichever is larger)
                 look_ahead_buffer_size = max(3, int(0.2 * params.audio_tokens_per_slice))
                 # Create an iterator from the async generator
-                token_iterator = async_generator_wrapper(sync_token_generator).__aiter__()
+                token_iterator = async_generator_wrapper(sync_token_generator, batch_size=(look_ahead_buffer_size + params.audio_tokens_per_slice)).__aiter__()
                 generator_exhausted = False # Initialize the flag
 
                 while True:
@@ -561,23 +589,23 @@ class TextToSpeechEngine:
 
                 # 4. Cross-fading and Queueing
                 output_to_send = None
-                fade_len = int(self.sr * (params.crossfade_duration_milliseconds / 1000.0))
+
+                fade_len = self.fade_in_curve.shape[0] if self.fade_in_curve is not None else 0
 
                 if not is_first_audio_chunk_sent:
                     # --- First Chunk Logic ---
                     log.debug(f"{log_prefix} First audio chunk generated. Sending immediately.")
                     if fade_len > 0 and current_audio_chunk.shape[0] > fade_len:
-                         output_to_send = current_audio_chunk[:-fade_len]
-                         previous_audio_chunk = current_audio_chunk[-fade_len:]
+                        output_to_send = current_audio_chunk[:-fade_len]
+                        previous_audio_chunk = current_audio_chunk[-fade_len:]
                     else:
-                         output_to_send = current_audio_chunk
-                         previous_audio_chunk = None
+                        output_to_send = current_audio_chunk
+                        previous_audio_chunk = None
                     is_first_audio_chunk_sent = True
                 else:
                     # --- Standard Cross-fade Logic ---
                     can_fade = (
-                        params.crossfade_duration_milliseconds > 0
-                        and fade_len > 0
+                        self.fade_in_curve is not None
                         and previous_audio_chunk is not None
                         and previous_audio_chunk.shape[0] == fade_len
                         and current_audio_chunk.shape[0] > fade_len
@@ -585,10 +613,7 @@ class TextToSpeechEngine:
 
                     if can_fade:
                         current_head = current_audio_chunk[:fade_len]
-                        t = torch.linspace(0, 1, fade_len, device=self.device)
-                        fade_out = torch.cos(t * 0.5 * torch.pi)
-                        fade_in = torch.sin(t * 0.5 * torch.pi)
-                        mixed_region = (previous_audio_chunk * fade_out) + (current_head * fade_in)
+                        mixed_region = (previous_audio_chunk * self.fade_out_curve) + (current_head * self.fade_in_curve)
 
                         current_main_body = current_audio_chunk[fade_len:-fade_len] if current_audio_chunk.shape[0] > fade_len * 2 else torch.tensor([], device=self.device)
                         output_to_send = torch.cat((mixed_region, current_main_body))
@@ -697,6 +722,16 @@ class TextToSpeechEngine:
         t3_stream = torch.cuda.Stream() if is_cuda else None
         s3gen_stream = torch.cuda.Stream() if is_cuda else None
 
+        # Pre-calculate fade curves to avoid repeated computation in the hot loop
+        fade_len = int(self.sr * (crossfade_duration_milliseconds / 1000.0))
+        if fade_len > 0:
+            t = torch.linspace(0, 1, fade_len, device=self.device)
+            self.fade_out_curve = torch.cos(t * 0.5 * torch.pi)
+            self.fade_in_curve = torch.sin(t * 0.5 * torch.pi)
+        else:
+            self.fade_in_curve = None
+            self.fade_out_curve = None
+
         # 4. Create Synthesis Parameters
         synthesis_params = SynthesisParams(
             text_tokens=None,
@@ -768,13 +803,6 @@ class TextToSpeechEngine:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-    # def shutdown(self):
-    #     """Shuts down the executors."""
-    #     log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-    #     log.info(f"{log_prefix} Shutting down executors...")
-    #     self.pcm_conversion_executor.shutdown(wait=True)
-    #     self.text_processing_executor.shutdown(wait=True)
 
 
 class TTSEngineManager:
