@@ -11,7 +11,7 @@ import zmq.asyncio
 import pickle
 from src.tts_streaming import TextToSpeechEngine
 from src.logging_config import configure_logging, log
-from src.ipc import setup_worker_sockets, TTSRequest, TTSStreamChunk
+from src.ipc import setup_worker_sockets, TTSRequest, TTSStreamChunk, WorkerStatus
 from src.tts_streaming import CancellationToken
 from typing import Dict
 
@@ -82,7 +82,12 @@ async def main(worker_id: int, device: str):
         log.info(f"Engine initialized successfully on {device}.")
 
         job_socket, result_socket, broadcast_socket = setup_worker_sockets(context)
-        log.info("Sockets connected. Listening for jobs...")
+
+        # Announce that this worker is ready
+        status_update = WorkerStatus(worker_id=worker_id, status="ready")
+        await result_socket.send(pickle.dumps(status_update))
+
+        log.info("Sockets connected. Sent 'ready' status to master. Listening for jobs...")
 
         # Start the job listener and broadcast listener tasks
         listener_tasks = [

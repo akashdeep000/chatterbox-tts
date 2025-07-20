@@ -15,25 +15,38 @@ import pickle
 from typing import List, Dict
 from src.config import settings
 from src.logging_config import log
-from src.ipc import setup_master_sockets, TTSStreamChunk, BroadcastCommand
+from src.ipc import setup_master_sockets, TTSStreamChunk, BroadcastCommand, WorkerStatus
 from src.voice_manager import VoiceManager
 
 # Global state for the master process
 worker_processes: List[subprocess.Popen] = []
 # A dictionary to hold the asyncio Queues for each active request
 active_requests: Dict[str, asyncio.Queue] = {}
+# A set to track workers that have successfully initialized
+ready_workers: set[int] = set()
+
 
 async def result_listener(result_socket: zmq.asyncio.Socket):
     """Listens for results from workers and puts them into the correct request queue."""
     while True:
         try:
             result_payload = await result_socket.recv()
-            result: TTSStreamChunk = pickle.loads(result_payload)
+            result = pickle.loads(result_payload)
 
-            if result.request_id in active_requests:
-                await active_requests[result.request_id].put(result)
+            if isinstance(result, TTSStreamChunk):
+                if result.request_id in active_requests:
+                    await active_requests[result.request_id].put(result)
+                else:
+                    # This can happen if a request is cancelled and the queue is deleted
+                    # before the final chunks arrive from the worker.
+                    log.warning(f"Received result for unknown or cancelled request_id: {result.request_id}")
+            elif isinstance(result, WorkerStatus):
+                if result.status == "ready":
+                    ready_workers.add(result.worker_id)
+                    log.info(f"Worker {result.worker_id} reported status: READY. Total ready: {len(ready_workers)}/{len(worker_processes)}")
             else:
-                log.warning(f"Received result for unknown request_id: {result.request_id}")
+                log.warning(f"Received unknown message type from worker: {type(result)}")
+
         except Exception as e:
             log.error(f"Error in result listener: {e}", exc_info=True)
 
@@ -62,8 +75,13 @@ def spawn_workers(broadcast_socket: zmq.asyncio.Socket):
 
     # --- Broadcast Voice List for Cache Warming ---
     async def broadcast_voice_list():
-        # Give workers a moment to initialize their sockets
-        await asyncio.sleep(5)
+        # Wait until all spawned workers have reported as ready
+        total_workers = len(worker_processes)
+        log.info(f"Waiting for all {total_workers} workers to report as ready...")
+        while len(ready_workers) < total_workers:
+            await asyncio.sleep(1)
+
+        log.info("All workers are ready. Proceeding with cache warming.")
 
         voice_manager = VoiceManager()
         voice_ids = voice_manager.list_voices()

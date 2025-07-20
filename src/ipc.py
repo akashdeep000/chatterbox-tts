@@ -51,6 +51,13 @@ class BroadcastCommand:
     command: str
     details: dict = field(default_factory=dict)
 
+@dataclass
+class WorkerStatus:
+    """A dataclass for worker status updates."""
+    worker_id: int
+    status: str  # e.g., "ready", "error"
+    message: Optional[str] = None
+
 def setup_master_sockets(context: zmq.asyncio.Context) -> tuple:
     """Sets up the sockets for the master process."""
     job_socket = context.socket(zmq.PUSH)
