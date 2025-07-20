@@ -51,6 +51,7 @@ from src.text_processing import split_text_into_chunks
 from src.logging_config import log
 from .audio_encoding import AudioEncoder
 
+from .process_pool_workers import initialize_tokenizer, tokenize_chunk_worker
 
 async def async_generator_wrapper(sync_generator: Generator, executor: concurrent.futures.Executor, batch_size: int = 32):
     """
@@ -444,10 +445,11 @@ class TextToSpeechEngine:
                 is_last_text_chunk = (i == num_chunks - 1)
 
                 log.info(f"{log_prefix} Processing text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                # 1. Text to Tokens (using ThreadPoolExecutor for stability)
-                text_tokens = await loop.run_in_executor(
-                    self.text_tokenization_executor, self.tts.tokenizer.text_to_tokens, chunk
+                # 1. Text to Tokens (using ProcessPoolExecutor for true parallelism)
+                token_list = await loop.run_in_executor(
+                    self.text_tokenization_executor, tokenize_chunk_worker, chunk
                 )
+                text_tokens = torch.tensor(token_list, dtype=torch.long)
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
 
@@ -882,7 +884,14 @@ class TTSEngineManager:
 
         self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
         self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
-        self.text_tokenization_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
+        # Use a ProcessPoolExecutor for the CPU-bound tokenization to bypass the GIL.
+        # The initializer ensures each worker process has its own tokenizer instance, avoiding pickling errors.
+        tokenizer_path = os.path.join(settings.MODEL_PATH, "tokenizer.json")
+        self.text_tokenization_executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=total_workers,
+            initializer=initialize_tokenizer,
+            initargs=(tokenizer_path,)
+        )
         self.t3_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
         self.s3gen_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
         self.voice_conditioning_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
