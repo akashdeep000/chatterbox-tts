@@ -54,11 +54,8 @@ async def handle_request(engine: TextToSpeechEngine, result_socket: zmq.asyncio.
     except Exception as e:
         log.error(f"Error processing request {request.request_id}: {e}", exc_info=True)
         # Optionally, send an error message back to the master
-    finally:
-        # Ensure the token is removed from the mapping when the request is done
-        if request.request_id in active_cancellations:
-            del active_cancellations[request.request_id]
-            log.info(f"Cleaned up cancellation token for request {request.request_id}")
+    # The cancellation token is now cleaned up via a broadcast command from the master
+    # when the stream is closed on the API side. This prevents a race condition.
 
 async def listen_for_jobs(engine: TextToSpeechEngine, job_socket: zmq.asyncio.Socket, result_socket: zmq.asyncio.Socket):
     """Continuously listens for jobs and creates tasks to handle them."""
