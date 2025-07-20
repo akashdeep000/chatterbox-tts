@@ -256,7 +256,7 @@ class TextToSpeechEngine:
             log.info("Performing warm-up run for compiled T3 model...")
             try:
                 # Use default conditionals if available, otherwise this will raise an error
-                conds = await self._prepare_and_get_conds(None, 0.5, loop, "warmup")
+                conds = await self._prepare_and_get_conds(None, loop, "warmup")
 
                 # Create dummy text input
                 warmup_text = "compiling"
