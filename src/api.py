@@ -99,12 +99,30 @@ def register_api_routes(app: FastAPI):
         async def stream_generator():
             try:
                 while True:
-                    result: TTSStreamChunk = await result_queue.get()
-                    if result.is_final:
-                        break
-                    yield result.chunk
+                    try:
+                        # Wait for a result, but with a short timeout to yield control
+                        result: TTSStreamChunk = await asyncio.wait_for(result_queue.get(), timeout=0.1)
+                        if result.is_final:
+                            # This is the sentinel, do not yield it.
+                            break
+                        yield result.chunk
+                    except asyncio.TimeoutError:
+                        # This is our "little break". The queue was empty.
+                        # We'll just loop again and check for a result.
+                        continue
             finally:
-                del active_requests[request_id]
+                # This block runs when the client disconnects OR the stream finishes.
+                # We broadcast the cancellation first to stop the worker from sending more data.
+                log.info(f"Broadcasting cancellation/cleanup command for request_id: {request_id}")
+                command = BroadcastCommand(command="cancel_request", details={"request_id": request_id})
+                await broadcast_socket.send(pickle.dumps(command))
+
+                # Give the command a moment to propagate before we clean up the master's state.
+                await asyncio.sleep(0.1)
+
+                # Now, clean up the request from the master's perspective.
+                if request_id in active_requests:
+                    del active_requests[request_id]
 
         return StreamingResponse(stream_generator(), media_type="audio/pcm") # Media type should be dynamic
 

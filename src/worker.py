@@ -12,10 +12,20 @@ import pickle
 from src.tts_streaming import TextToSpeechEngine
 from src.logging_config import configure_logging, log
 from src.ipc import setup_worker_sockets, TTSRequest, TTSStreamChunk
+from src.tts_streaming import CancellationToken
+from typing import Dict
+
+# Worker-specific mapping of request_id to its cancellation token
+active_cancellations: Dict[str, CancellationToken] = {}
+
 
 async def handle_request(engine: TextToSpeechEngine, result_socket: zmq.asyncio.Socket, request: TTSRequest):
     """Handles a single TTS request and streams the results back."""
     log.info(f"Processing request {request.request_id}...")
+    loop = asyncio.get_running_loop()
+    cancellation_token = CancellationToken(loop)
+    active_cancellations[request.request_id] = cancellation_token
+
     try:
         audio_generator = engine.stream(
             text=request.text,
@@ -29,7 +39,8 @@ async def handle_request(engine: TextToSpeechEngine, result_socket: zmq.asyncio.
             remove_leading_milliseconds=request.remove_leading_milliseconds,
             chunk_overlap_strategy=request.chunk_overlap_strategy,
             crossfade_duration_milliseconds=request.crossfade_duration_milliseconds,
-            request_id=request.request_id
+            request_id=request.request_id,
+            cancellation_token=cancellation_token
         )
 
         async for chunk in audio_generator:
@@ -43,6 +54,11 @@ async def handle_request(engine: TextToSpeechEngine, result_socket: zmq.asyncio.
     except Exception as e:
         log.error(f"Error processing request {request.request_id}: {e}", exc_info=True)
         # Optionally, send an error message back to the master
+    finally:
+        # Ensure the token is removed from the mapping when the request is done
+        if request.request_id in active_cancellations:
+            del active_cancellations[request.request_id]
+            log.info(f"Cleaned up cancellation token for request {request.request_id}")
 
 async def listen_for_jobs(engine: TextToSpeechEngine, job_socket: zmq.asyncio.Socket, result_socket: zmq.asyncio.Socket):
     """Continuously listens for jobs and creates tasks to handle them."""
@@ -94,6 +110,14 @@ async def listen_for_broadcasts(engine: TextToSpeechEngine, broadcast_socket: zm
                 voice_id = command.details.get("voice_id")
                 engine.clear_voice_cache(voice_id)
                 log.info(f"Cleared voice cache for '{voice_id}' as per broadcast command.")
+
+            elif command.command == "cancel_request":
+                request_id = command.details.get("request_id")
+                if request_id in active_cancellations:
+                    active_cancellations[request_id].cancel()
+                    log.info(f"Cancellation signal sent for request_id: {request_id}")
+                else:
+                    log.warning(f"Received cancellation for unknown or completed request_id: {request_id}")
 
             elif command.command == "warm_up_voices":
                 voice_ids = command.details.get("voice_ids", [])

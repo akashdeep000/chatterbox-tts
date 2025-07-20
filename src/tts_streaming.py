@@ -86,6 +86,24 @@ async def async_generator_wrapper(sync_generator: Generator, executor: concurren
 
 
 @dataclass
+class CancellationToken:
+    """A token to signal cancellation to running tasks, using an asyncio.Event."""
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._event = asyncio.Event()
+
+    def cancel(self):
+        """Signal cancellation."""
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        """Check if cancellation has been signaled."""
+        return self._event.is_set()
+
+    async def wait(self):
+        """Wait for the cancellation signal."""
+        await self._event.wait()
+
+@dataclass
 class Conditionals:
     """Holds conditioning information for TTS models."""
     t3: T3Cond
@@ -116,6 +134,7 @@ class SynthesisParams:
     loop: asyncio.AbstractEventLoop
     text_chunk_count: int
     request_id: str
+    cancellation_token: "CancellationToken"
 
 
 class _AudioProcessor:
@@ -432,6 +451,9 @@ class TextToSpeechEngine:
 
         try:
             for i, chunk in enumerate(text_chunks):
+                if params.cancellation_token.is_cancelled():
+                    log.info(f"{log_prefix} Cancellation detected. Stopping T3 producer.")
+                    break
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
 
@@ -480,12 +502,33 @@ class TextToSpeechEngine:
                 generator_exhausted = False # Initialize the flag
 
                 while True:
+                    if params.cancellation_token.is_cancelled():
+                        log.info(f"{log_prefix} Cancellation detected during token iteration.")
+                        break
+
+                    get_item_task = asyncio.create_task(token_iterator.__anext__())
+                    cancel_task = asyncio.create_task(params.cancellation_token.wait())
+                    done, pending = await asyncio.wait(
+                        [get_item_task, cancel_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    if cancel_task in done:
+                        get_item_task.cancel()
+                        log.info(f"{log_prefix} Cancellation detected while waiting for token. Stopping T3 producer.")
+                        break
+
+                    for task in pending:
+                        task.cancel()
+
                     try:
-                        # Fill up current_slice as tokens come
-                        current_slice.append(await token_iterator.__anext__())
+                        token = get_item_task.result()
+                        current_slice.append(token)
                     except StopAsyncIteration:
-                        # Generator is exhausted. Process remaining tokens.
                         generator_exhausted = True
+                    except asyncio.CancelledError:
+                        log.info(f"{log_prefix} Get token task was cancelled.")
+                        break
 
                     # If current_slice length is larger than (look_ahead_buffer_size + audio_tokens_per_slice)
                     # send first audio_tokens_per_slice tokens to s3gen queue.
@@ -566,11 +609,32 @@ class TextToSpeechEngine:
 
         try:
             while True:
-                start_time = time.time()
-                log.debug(f"{log_prefix} Waiting for speech tokens. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                queue_item = await speech_token_queue.get()
-                wait_time = time.time() - start_time
-                log.debug(f"{log_prefix} Waited for speech tokens for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+                if params.cancellation_token.is_cancelled():
+                    log.info(f"{log_prefix} Cancellation detected. Stopping S3Gen producer.")
+                    break
+
+                get_item_task = asyncio.create_task(speech_token_queue.get())
+                cancel_task = asyncio.create_task(params.cancellation_token.wait())
+                done, pending = await asyncio.wait(
+                    [get_item_task, cancel_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if cancel_task in done:
+                    get_item_task.cancel() # Cancel the pending queue.get()
+                    log.info(f"{log_prefix} Cancellation detected while waiting for speech token. Stopping S3Gen producer.")
+                    break
+
+                # If we are here, get_item_task is done.
+                for task in pending:
+                    task.cancel()
+
+                try:
+                    queue_item = get_item_task.result()
+                except asyncio.CancelledError:
+                    log.info(f"{log_prefix} Get item task was cancelled.")
+                    break
+
                 if queue_item is None:
                     break
 
@@ -707,11 +771,31 @@ class TextToSpeechEngine:
         log_prefix = f"[{params.request_id}][PCM_CONSUMER]"
         try:
             while True:
-                start_time = time.time()
-                log.debug(f"{log_prefix} Waiting for audio tensor. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                queue_item = await gpu_audio_queue.get()
-                wait_time = time.time() - start_time
-                log.debug(f"{log_prefix} Waited for audio tensor for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+                if params.cancellation_token.is_cancelled():
+                    log.info(f"{log_prefix} Cancellation detected. Stopping PCM consumer.")
+                    break
+
+                get_item_task = asyncio.create_task(gpu_audio_queue.get())
+                cancel_task = asyncio.create_task(params.cancellation_token.wait())
+                done, pending = await asyncio.wait(
+                    [get_item_task, cancel_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if cancel_task in done:
+                    get_item_task.cancel()
+                    log.info(f"{log_prefix} Cancellation detected while waiting for audio tensor. Stopping PCM consumer.")
+                    break
+
+                for task in pending:
+                    task.cancel()
+
+                try:
+                    queue_item = get_item_task.result()
+                except asyncio.CancelledError:
+                    log.info(f"{log_prefix} Get item task was cancelled.")
+                    break
+
                 if queue_item is None:
                     break
                 audio_tensor, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk = queue_item
@@ -741,7 +825,8 @@ class TextToSpeechEngine:
         remove_leading_milliseconds: int,
         chunk_overlap_strategy: Literal["zero", "full"],
         crossfade_duration_milliseconds: int,
-        request_id: str
+        request_id: str,
+        cancellation_token: CancellationToken
     ) -> AsyncGenerator[bytes, None]:
         """Streams synthesized audio in the specified format."""
         if self._initialization_state != InitializationState.READY:
@@ -799,7 +884,8 @@ class TextToSpeechEngine:
             crossfade_duration_milliseconds=crossfade_duration_milliseconds,
             loop=loop,
             text_chunk_count=len(text_chunks),
-            request_id=request_id
+            request_id=request_id,
+            cancellation_token=cancellation_token # This is now passed in
         )
 
         # 5. Start Producer and Consumer Tasks
@@ -812,6 +898,8 @@ class TextToSpeechEngine:
         pcm_consumer = asyncio.create_task(
             self._pcm_consumer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params)
         )
+        tasks = [t3_producer, s3gen_producer, pcm_consumer]
+
 
         # 6. Setup Audio Encoder
         log_prefix = f"[{request_id}]"
@@ -825,10 +913,31 @@ class TextToSpeechEngine:
         async def pcm_generator():
             """Generator that yields PCM chunks from the queue."""
             while True:
-                log.debug(f"{log_prefix} Waiting for PCM chunk. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                chunk = await pcm_chunk_queue.get()
-                wait_time = time.time() - start_time
-                log.debug(f"{log_prefix} Waited for PCM chunk for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+                if cancellation_token.is_cancelled():
+                    log.debug(f"{log_prefix} Cancellation detected in PCM generator.")
+                    break
+
+                get_item_task = asyncio.create_task(pcm_chunk_queue.get())
+                cancel_task = asyncio.create_task(cancellation_token.wait())
+                done, pending = await asyncio.wait(
+                    [get_item_task, cancel_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if cancel_task in done:
+                    get_item_task.cancel()
+                    log.info(f"{log_prefix} Cancellation detected while waiting for PCM chunk. Stopping PCM generator.")
+                    break
+
+                for task in pending:
+                    task.cancel()
+
+                try:
+                    chunk = get_item_task.result()
+                except asyncio.CancelledError:
+                    log.info(f"{log_prefix} Get item task was cancelled.")
+                    break
+
                 if chunk is None:
                     log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
                     break
@@ -846,7 +955,7 @@ class TextToSpeechEngine:
         finally:
             # Cleanup: Cancel tasks and clear tensors
             log.info(f"{log_prefix} Cleaning up...")
-            tasks = [t3_producer, s3gen_producer, pcm_consumer]
+            # The cancellation_token is now managed by the caller (the worker)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
