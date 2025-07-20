@@ -14,6 +14,7 @@ from typing import Optional
 import zmq.asyncio
 import time
 
+from src.audio_encoding import AudioEncoder
 from src.config import settings, tts_config
 from src.voice_manager import VoiceManager
 from src.ipc import TTSRequest, TTSStreamChunk, BroadcastCommand
@@ -77,7 +78,7 @@ def register_api_routes(app: FastAPI):
 
         request_id = request.state.request_id
         # Create a queue with a max size to apply backpressure
-        result_queue = asyncio.Queue(maxsize=100)
+        result_queue = asyncio.Queue(maxsize=2000)
         active_requests[request_id] = result_queue
 
         ipc_request = TTSRequest(
@@ -125,7 +126,19 @@ def register_api_routes(app: FastAPI):
                 if request_id in active_requests:
                     del active_requests[request_id]
 
-        return StreamingResponse(stream_generator(), media_type="audio/pcm") # Media type should be dynamic
+        try:
+            # Instantiate a temporary encoder just to get the correct MIME type.
+            # The sample_rate is required for the constructor but not for get_mime_type.
+            temp_encoder = AudioEncoder(output_format=tts_request.format, sample_rate=24000)
+            media_type = temp_encoder.get_mime_type()
+        except ValueError:
+            # This will be raised by AudioFormat(output_format.lower()) if the format is invalid
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid audio format: '{tts_request.format}'. Supported formats are: wav, raw_pcm, fmp4, mp3, webm"
+            )
+
+        return StreamingResponse(stream_generator(), media_type=media_type)
 
     @app.post("/voices", dependencies=[Depends(get_api_key)])
     async def upload_voice(file: UploadFile = File(...)):

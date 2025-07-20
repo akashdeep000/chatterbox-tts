@@ -284,7 +284,7 @@ class AudioEncoder:
             while True:
                 # Read small chunks for instant processing
                 chunk = await asyncio.get_event_loop().run_in_executor(
-                    None, self.ffmpeg_process.stdout.read, 1024
+                    None, self.ffmpeg_process.stdout.read, 4096
                 )
 
                 if not chunk:
