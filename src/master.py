@@ -28,10 +28,13 @@ ready_workers: set[int] = set()
 
 async def result_listener(result_socket: zmq.asyncio.Socket):
     """Listens for results from workers and puts them into the correct request queue."""
+    loop = asyncio.get_running_loop()
+    # We use a default executor (ThreadPoolExecutor) for the CPU-bound pickle.loads
     while True:
         try:
             result_payload = await result_socket.recv()
-            result = pickle.loads(result_payload)
+            # Run the CPU-bound deserialization in a separate thread to avoid blocking the event loop
+            result = await loop.run_in_executor(None, pickle.loads, result_payload)
 
             if isinstance(result, TTSStreamChunk):
                 if result.request_id in active_requests:

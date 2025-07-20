@@ -76,7 +76,8 @@ def register_api_routes(app: FastAPI):
             return JSONResponse(content={"error": "Text is required"}, status_code=400)
 
         request_id = request.state.request_id
-        result_queue = asyncio.Queue()
+        # Create a queue with a max size to apply backpressure
+        result_queue = asyncio.Queue(maxsize=100)
         active_requests[request_id] = result_queue
 
         ipc_request = TTSRequest(
@@ -99,17 +100,17 @@ def register_api_routes(app: FastAPI):
         async def stream_generator():
             try:
                 while True:
-                    try:
-                        # Wait for a result, but with a short timeout to yield control
-                        result: TTSStreamChunk = await asyncio.wait_for(result_queue.get(), timeout=0.1)
-                        if result.is_final:
-                            # This is the sentinel, do not yield it.
-                            break
-                        yield result.chunk
-                    except asyncio.TimeoutError:
-                        # This is our "little break". The queue was empty.
-                        # We'll just loop again and check for a result.
-                        continue
+                    result: TTSStreamChunk = await result_queue.get()
+                    if result.is_final:
+                        break
+
+                    # This yield will raise an exception if the client disconnects.
+                    yield result.chunk
+
+                    # Explicitly yield control to the event loop after every chunk.
+                    # This prevents this loop from starving the event loop if the
+                    # client is consuming very quickly.
+                    await asyncio.sleep(0)
             finally:
                 # This block runs when the client disconnects OR the stream finishes.
                 # We broadcast the cancellation first to stop the worker from sending more data.
