@@ -52,10 +52,10 @@ from src.logging_config import log
 from .audio_encoding import AudioEncoder
 
 
-async def async_generator_wrapper(sync_generator: Generator, batch_size: int = 32):
+async def async_generator_wrapper(sync_generator: Generator, executor: concurrent.futures.Executor, batch_size: int = 32):
     """
     Wraps a synchronous generator to make it asynchronously iterable.
-    Items are fetched in batches using asyncio.to_thread to reduce overhead and prevent blocking.
+    Items are fetched in batches using a dedicated executor to reduce overhead and prevent blocking.
     """
     _END_OF_GENERATOR = object() # Local sentinel to signal generator exhaustion
 
@@ -76,8 +76,8 @@ async def async_generator_wrapper(sync_generator: Generator, batch_size: int = 3
 
     loop = asyncio.get_running_loop()
     while True:
-        # Run the synchronous helper in a separate thread to avoid blocking the event loop
-        item_batch = await loop.run_in_executor(None, _get_next_batch_safe)
+        # Run the synchronous helper in the provided dedicated executor
+        item_batch = await loop.run_in_executor(executor, _get_next_batch_safe)
         if item_batch is _END_OF_GENERATOR:
             break
 
@@ -149,7 +149,7 @@ class TextToSpeechEngine:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
-    def __init__(self, gpu_id: int = 0):
+    def __init__(self, gpu_id: int = 0, pcm_conversion_executor=None, text_processing_executor=None, text_tokenization_executor=None, t3_producer_executor=None, s3gen_producer_executor=None, voice_conditioning_executor=None):
         """
         Initializes the TTS engine, setting up basic attributes.
         Model loading and device setup are handled asynchronously by `ainit`.
@@ -166,26 +166,18 @@ class TextToSpeechEngine:
         self._initialization_progress: str = ""
         self._initialization_error: Optional[str] = None
         self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
-        )
-        self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
-        )
-        self.text_tokenization_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER
-        )
+
+        # Use shared executors if provided, otherwise create new ones for standalone use.
+        self.pcm_conversion_executor = pcm_conversion_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.text_processing_executor = text_processing_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.text_tokenization_executor = text_tokenization_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.t3_producer_executor = t3_producer_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.s3gen_producer_executor = s3gen_producer_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.voice_conditioning_executor = voice_conditioning_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+
         self.fade_in_curve = None
         self.fade_out_curve = None
 
-    def shutdown(self):
-        """Gracefully shuts down the thread and process pools."""
-        log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-        log.info(f"{log_prefix} Shutting down executors...")
-        self.pcm_conversion_executor.shutdown(wait=True)
-        self.text_processing_executor.shutdown(wait=True)
-        self.text_tokenization_executor.shutdown(wait=True)
-        log.info(f"{log_prefix} Executors shut down.")
 
     async def ainit(self):
         """
@@ -312,7 +304,7 @@ class TextToSpeechEngine:
         voice_id = Path(audio_prompt_path).name if audio_prompt_path else "default"
         if audio_prompt_path and voice_id not in self.voice_cache:
             log.info(f"{log_prefix}[{request_id}] Voice '{voice_id}' not in cache. Preparing new conditionals...")
-            await loop.run_in_executor(None, self.prepare_conditionals, audio_prompt_path, voice_exaggeration_factor)
+            await loop.run_in_executor(self.voice_conditioning_executor, self.prepare_conditionals, audio_prompt_path, voice_exaggeration_factor)
             log.info(f"{log_prefix}[{request_id}] Finished preparing conditionals for '{voice_id}'.")
         elif audio_prompt_path:
             log.info(f"{log_prefix}[{request_id}] Using cached conditionals for voice '{voice_id}'.")
@@ -404,9 +396,9 @@ class TextToSpeechEngine:
 
                 # 2. T3 Inference (blocking)
                 log.info(f"{log_prefix} Starting inference for chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                # 3. T3 Inference (non-blocking)
+                # 3. T3 Inference (non-blocking, using the dedicated T3 executor)
                 sync_token_generator = await loop.run_in_executor(
-                    None,
+                    self.t3_producer_executor,
                     self._blocking_t3_inference,
                     params.conds.t3,
                     text_tokens,
@@ -423,7 +415,7 @@ class TextToSpeechEngine:
                 # Define the look-ahead buffer size (20% of audio_tokens_per_slice or 10 tokens, whichever is larger)
                 look_ahead_buffer_size = max(3, int(0.2 * params.audio_tokens_per_slice))
                 # Create an iterator from the async generator
-                token_iterator = async_generator_wrapper(sync_token_generator, batch_size=(look_ahead_buffer_size + params.audio_tokens_per_slice)).__aiter__()
+                token_iterator = async_generator_wrapper(sync_token_generator, self.t3_producer_executor, batch_size=(look_ahead_buffer_size + params.audio_tokens_per_slice)).__aiter__()
                 generator_exhausted = False # Initialize the flag
 
                 while True:
@@ -471,6 +463,9 @@ class TextToSpeechEngine:
                     # Break condition: if generator is exhausted and all buffered tokens have been sent
                     if generator_exhausted and not current_slice:
                         break
+
+                # Yield control to the event loop to allow other tasks to run.
+                await asyncio.sleep(0)
 
                 t3_inference_time = time.time() - t3_start_time
                 log.info(f"{log_prefix} Finished inference for chunk {i+1}/{num_chunks} ({slice_idx} slices) in {t3_inference_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
@@ -560,7 +555,7 @@ class TextToSpeechEngine:
                 # 2. S3Gen Inference
                 s3gen_start_time = time.time()
                 wav, new_cache_source = await loop.run_in_executor(
-                    None,
+                    self.s3gen_producer_executor,
                     self._blocking_s3gen_inference,
                     speech_tokens_for_inference,
                     params.conds.gen,
@@ -810,14 +805,35 @@ class TTSEngineManager:
 
     def __init__(self, num_gpus: int):
         """
-        Initializes the manager and creates a TTS engine for each GPU.
+        Initializes the manager, creates shared executors, and creates a TTS engine for each GPU.
         """
         self.num_gpus = num_gpus
+
+        # Create a single, shared set of executors for all engines to use.
+        # This prevents thread over-allocation when using multiple GPUs.
+        total_workers = settings.CONCURRENT_REQUESTS_PER_WORKER * (num_gpus if num_gpus > 0 else 1)
+
+        self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
+        self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
+        self.text_tokenization_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
+        self.t3_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
+        self.s3gen_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
+        self.voice_conditioning_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        engine_args = {
+            "pcm_conversion_executor": self.pcm_conversion_executor,
+            "text_processing_executor": self.text_processing_executor,
+            "text_tokenization_executor": self.text_tokenization_executor,
+            "t3_producer_executor": self.t3_producer_executor,
+            "s3gen_producer_executor": self.s3gen_producer_executor,
+            "voice_conditioning_executor": self.voice_conditioning_executor,
+        }
+
         if self.num_gpus > 0:
-            self.engines: List[TextToSpeechEngine] = [TextToSpeechEngine(gpu_id=i) for i in range(num_gpus)]
+            self.engines: List[TextToSpeechEngine] = [TextToSpeechEngine(gpu_id=i, **engine_args) for i in range(num_gpus)]
         else:
             # Fallback to a single CPU engine if no GPUs are detected
-            self.engines: List[TextToSpeechEngine] = [TextToSpeechEngine(gpu_id=0)]
+            self.engines: List[TextToSpeechEngine] = [TextToSpeechEngine(gpu_id=0, **engine_args)]
         self._lock = asyncio.Lock()
         self._next_engine_index = 0
 
@@ -854,3 +870,14 @@ class TTSEngineManager:
         Returns the initialization status of all managed engines.
         """
         return {f"gpu_{engine.gpu_id}": engine.get_initialization_status() for engine in self.engines}
+
+    def shutdown(self):
+        """Shuts down all shared executors."""
+        log.info("Shutting down all shared executors...")
+        self.pcm_conversion_executor.shutdown(wait=True)
+        self.text_processing_executor.shutdown(wait=True)
+        self.text_tokenization_executor.shutdown(wait=True)
+        self.t3_producer_executor.shutdown(wait=True)
+        self.s3gen_producer_executor.shutdown(wait=True)
+        self.voice_conditioning_executor.shutdown(wait=True)
+        log.info("All shared executors shut down.")
