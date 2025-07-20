@@ -446,10 +446,12 @@ class TextToSpeechEngine:
 
                 log.info(f"{log_prefix} Processing text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 # 1. Text to Tokens (using ProcessPoolExecutor for true parallelism)
+                tokenizer_start_time = time.time()
                 token_list = await loop.run_in_executor(
                     self.text_tokenization_executor, tokenize_chunk_worker, chunk
                 )
                 text_tokens = torch.tensor(token_list, dtype=torch.long)
+                log.info(f"{log_prefix} Tokenizer took {time.time() - tokenizer_start_time:.4f}s")
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
 
