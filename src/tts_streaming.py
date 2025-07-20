@@ -241,6 +241,73 @@ class TextToSpeechEngine:
             )
             self.sr = self.tts.sr # Set sample rate from the loaded model
 
+            # Compile the T3 model for performance, with a fallback for safety.
+            log.info(f"{log_prefix} Attempting to compile T3 model with torch.compile...")
+            try:
+                compiled_t3 = torch.compile(self.tts.t3, mode="reduce-overhead", fullgraph=True)
+                self.tts.t3 = compiled_t3
+                # Verify that the model is now a compiled module
+                if "OptimizedModule" in str(type(self.tts.t3)):
+                    log.info(f"{log_prefix} T3 model successfully compiled.")
+                else:
+                    log.warning(f"{log_prefix} T3 model compilation did not return an OptimizedModule. Type is {type(self.tts.t3)}")
+            except Exception as e:
+                log.warning(f"{log_prefix} T3 model compilation failed: {e}. Falling back to the original model.")
+
+            # Warm-up run to pay the compilation cost upfront
+            log.info(f"{log_prefix} Performing warm-up run for compiled T3 model...")
+            try:
+                # Use default conditionals if available, otherwise this will raise an error
+                conds = await self._prepare_and_get_conds(None, 0.5, loop, "warmup")
+
+                # Create dummy text input
+                warmup_text = "compiling"
+                text_tokens = self.tts.tokenizer.text_to_tokens(warmup_text).to(self.device)
+                sot, eot = self.tts.t3.hp.start_text_token, self.tts.t3.hp.stop_text_token
+                text_tokens = F.pad(F.pad(text_tokens, (1, 0), value=sot), (0, 1), value=eot)
+
+                # Run a few steps of inference to trigger compilation
+                gen = self.tts.t3.inference_stream(
+                    t3_cond=conds.t3,
+                    text_tokens=text_tokens,
+                    max_new_tokens=4, # Just need a few tokens
+                    cfg_weight=0.0
+                )
+                # Capture a token from the T3 warm-up to use for the S3Gen warm-up
+                warmup_speech_tokens = None
+                for token in gen:
+                    warmup_speech_tokens = token
+                    break # We only need one token
+
+                log.info(f"{log_prefix} T3 model warm-up complete.")
+
+                # Compile and warm-up the S3Gen model, with a fallback for safety.
+                log.info(f"{log_prefix} Attempting to compile S3Gen model with torch.compile...")
+                try:
+                    compiled_s3gen = torch.compile(self.tts.s3gen, mode="reduce-overhead", fullgraph=True)
+                    self.tts.s3gen = compiled_s3gen
+                    if "OptimizedModule" in str(type(self.tts.s3gen)):
+                        log.info(f"{log_prefix} S3Gen model successfully compiled.")
+                    else:
+                        log.warning(f"{log_prefix} S3Gen model compilation did not return an OptimizedModule. Type is {type(self.tts.s3gen)}")
+                except Exception as e:
+                    log.warning(f"{log_prefix} S3Gen model compilation failed: {e}. Falling back to the original model.")
+
+                log.info(f"{log_prefix} Performing warm-up run for compiled S3Gen model...")
+                if warmup_speech_tokens is not None:
+                    # Use the token from the T3 warm-up to warm up S3Gen
+                    self.tts.s3gen.inference(
+                        speech_tokens=warmup_speech_tokens,
+                        ref_dict=conds.gen,
+                        cache_source=torch.zeros(1, 1, 0).to(self.device)
+                    )
+                    log.info(f"{log_prefix} S3Gen model warm-up complete.")
+                else:
+                    log.warning(f"{log_prefix} S3Gen model warm-up skipped: no tokens from T3 warm-up.")
+
+            except Exception as e:
+                log.warning(f"{log_prefix} Model warm-up failed: {e}. The first request may be slow.")
+
             self._initialization_state = InitializationState.READY
             self._initialization_progress = "Model ready"
             self._initialization_error = None
