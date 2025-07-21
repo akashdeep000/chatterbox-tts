@@ -193,7 +193,7 @@ class AudioEncoder:
             '-b:a', self.kwargs.get('bitrate', '64k'),
             '-f', 'mp4',
             '-movflags', 'frag_keyframe+empty_moov+default_base_moof+dash',
-            '-frag_duration', str(self.kwargs.get('fragment_duration', 20000)),  # 200ms
+            '-frag_duration', str(self.kwargs.get('fragment_duration', 500000)),  # 500ms
             '-flush_packets', '1',
             '-reset_timestamps', '1',
             '-avoid_negative_ts', 'make_zero',

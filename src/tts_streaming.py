@@ -829,139 +829,142 @@ class TextToSpeechEngine:
         cancellation_token: CancellationToken
     ) -> AsyncGenerator[bytes, None]:
         """Streams synthesized audio in the specified format."""
-        if self._initialization_state != InitializationState.READY:
-            raise RuntimeError(f"TTS Engine on GPU {self.gpu_id} is not ready. Status: {self._initialization_state.value}")
+        log.info(f"[{request_id}] New stream request. Waiting for semaphore. Current queue: {len(self.tts_semaphore._waiters) if hasattr(self.tts_semaphore, '_waiters') else 'N/A'}")
+        async with self.tts_semaphore:
+            log.info(f"[{request_id}] Semaphore acquired. Starting stream processing.")
+            if self._initialization_state != InitializationState.READY:
+                raise RuntimeError(f"TTS Engine on GPU {self.gpu_id} is not ready. Status: {self._initialization_state.value}")
 
-        loop = asyncio.get_running_loop()
-        first_chunk_generated = False
-        time_to_first_chunk = 0.0
-        start_time = time.time()
+            loop = asyncio.get_running_loop()
+            first_chunk_generated = False
+            time_to_first_chunk = 0.0
+            start_time = time.time()
 
-        # 1. Get Voice Conditionals
-        audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
-        conds = await self._prepare_and_get_conds(audio_prompt_path, loop, request_id)
+            # 1. Get Voice Conditionals
+            audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
+            conds = await self._prepare_and_get_conds(audio_prompt_path, loop, request_id)
 
-        # 2. Text Processing
-        text_chunks = await loop.run_in_executor(
-            self.text_processing_executor,
-            split_text_into_chunks,
-            text,
-            text_processing_chunk_size
-        )
-        if not text_chunks:
-            yield b''
-            return
+            # 2. Text Processing
+            text_chunks = await loop.run_in_executor(
+                self.text_processing_executor,
+                split_text_into_chunks,
+                text,
+                text_processing_chunk_size
+            )
+            if not text_chunks:
+                yield b''
+                return
 
-        # 3. Setup Queues and CUDA Streams
-        speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
-        gpu_audio_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
-        pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
-        is_cuda = self.device.startswith('cuda')
-        t3_stream = torch.cuda.Stream() if is_cuda else None
-        s3gen_stream = torch.cuda.Stream() if is_cuda else None
+            # 3. Setup Queues and CUDA Streams
+            speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
+            gpu_audio_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
+            pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
+            is_cuda = self.device.startswith('cuda')
+            t3_stream = torch.cuda.Stream() if is_cuda else None
+            s3gen_stream = torch.cuda.Stream() if is_cuda else None
 
-        # Pre-calculate fade curves to avoid repeated computation in the hot loop
-        fade_len = int(self.sr * (crossfade_duration_milliseconds / 1000.0))
-        if fade_len > 0:
-            t = torch.linspace(0, 1, fade_len, device=self.device)
-            self.fade_out_curve = torch.cos(t * 0.5 * torch.pi)
-            self.fade_in_curve = torch.sin(t * 0.5 * torch.pi)
-        else:
-            self.fade_in_curve = None
-            self.fade_out_curve = None
+            # Pre-calculate fade curves to avoid repeated computation in the hot loop
+            fade_len = int(self.sr * (crossfade_duration_milliseconds / 1000.0))
+            if fade_len > 0:
+                t = torch.linspace(0, 1, fade_len, device=self.device)
+                self.fade_out_curve = torch.cos(t * 0.5 * torch.pi)
+                self.fade_in_curve = torch.sin(t * 0.5 * torch.pi)
+            else:
+                self.fade_in_curve = None
+                self.fade_out_curve = None
 
-        # 4. Create Synthesis Parameters
-        synthesis_params = SynthesisParams(
-            text_tokens=None,
-            conds=conds,
-            cfg_guidance_weight=cfg_guidance_weight,
-            synthesis_temperature=synthesis_temperature,
-            text_processing_chunk_size=text_processing_chunk_size,
-            audio_tokens_per_slice=audio_tokens_per_slice,
-            remove_trailing_milliseconds=remove_trailing_milliseconds,
-            remove_leading_milliseconds=remove_leading_milliseconds,
-            chunk_overlap_strategy=chunk_overlap_strategy,
-            crossfade_duration_milliseconds=crossfade_duration_milliseconds,
-            loop=loop,
-            text_chunk_count=len(text_chunks),
-            request_id=request_id,
-            cancellation_token=cancellation_token # This is now passed in
-        )
+            # 4. Create Synthesis Parameters
+            synthesis_params = SynthesisParams(
+                text_tokens=None,
+                conds=conds,
+                cfg_guidance_weight=cfg_guidance_weight,
+                synthesis_temperature=synthesis_temperature,
+                text_processing_chunk_size=text_processing_chunk_size,
+                audio_tokens_per_slice=audio_tokens_per_slice,
+                remove_trailing_milliseconds=remove_trailing_milliseconds,
+                remove_leading_milliseconds=remove_leading_milliseconds,
+                chunk_overlap_strategy=chunk_overlap_strategy,
+                crossfade_duration_milliseconds=crossfade_duration_milliseconds,
+                loop=loop,
+                text_chunk_count=len(text_chunks),
+                request_id=request_id,
+                cancellation_token=cancellation_token # This is now passed in
+            )
 
-        # 5. Start Producer and Consumer Tasks
-        t3_producer = asyncio.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, t3_stream, s3gen_stream)
-        )
-        s3gen_producer = asyncio.create_task(
-            self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
-        )
-        pcm_consumer = asyncio.create_task(
-            self._pcm_consumer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params)
-        )
-        tasks = [t3_producer, s3gen_producer, pcm_consumer]
+            # 5. Start Producer and Consumer Tasks
+            t3_producer = asyncio.create_task(
+                self._t3_producer_task(text_chunks, speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, t3_stream, s3gen_stream)
+            )
+            s3gen_producer = asyncio.create_task(
+                self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
+            )
+            pcm_consumer = asyncio.create_task(
+                self._pcm_consumer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params)
+            )
+            tasks = [t3_producer, s3gen_producer, pcm_consumer]
 
 
-        # 6. Setup Audio Encoder
-        log_prefix = f"[{request_id}]"
+            # 6. Setup Audio Encoder
+            log_prefix = f"[{request_id}]"
 
-        encoder = AudioEncoder(
-            output_format,
-            self.sr,
-            log_prefix=log_prefix
-        )
+            encoder = AudioEncoder(
+                output_format,
+                self.sr,
+                log_prefix=log_prefix
+            )
 
-        async def pcm_generator():
-            """Generator that yields PCM chunks from the queue."""
-            while True:
-                if cancellation_token.is_cancelled():
-                    log.debug(f"{log_prefix} Cancellation detected in PCM generator.")
-                    break
+            async def pcm_generator():
+                """Generator that yields PCM chunks from the queue."""
+                while True:
+                    if cancellation_token.is_cancelled():
+                        log.debug(f"{log_prefix} Cancellation detected in PCM generator.")
+                        break
 
-                get_item_task = asyncio.create_task(pcm_chunk_queue.get())
-                cancel_task = asyncio.create_task(cancellation_token.wait())
-                done, pending = await asyncio.wait(
-                    [get_item_task, cancel_task],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+                    get_item_task = asyncio.create_task(pcm_chunk_queue.get())
+                    cancel_task = asyncio.create_task(cancellation_token.wait())
+                    done, pending = await asyncio.wait(
+                        [get_item_task, cancel_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                if cancel_task in done:
-                    get_item_task.cancel()
-                    log.info(f"{log_prefix} Cancellation detected while waiting for PCM chunk. Stopping PCM generator.")
-                    break
+                    if cancel_task in done:
+                        get_item_task.cancel()
+                        log.info(f"{log_prefix} Cancellation detected while waiting for PCM chunk. Stopping PCM generator.")
+                        break
 
-                for task in pending:
+                    for task in pending:
+                        task.cancel()
+
+                    try:
+                        chunk = get_item_task.result()
+                    except asyncio.CancelledError:
+                        log.info(f"{log_prefix} Get item task was cancelled.")
+                        break
+
+                    if chunk is None:
+                        log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
+                        break
+                    yield chunk
+                    pcm_chunk_queue.task_done()
+
+            # 7. Stream the output
+            try:
+                async for audio_chunk in encoder.encode(pcm_generator()):
+                    if not first_chunk_generated:
+                        time_to_first_chunk = time.time() - start_time
+                        log.info(f"[{request_id}] Time to first audio chunk: {time_to_first_chunk:.4f}s")
+                        first_chunk_generated = True
+                    yield audio_chunk
+            finally:
+                # Cleanup: Cancel tasks and clear tensors
+                log.info(f"{log_prefix} Cleaning up...")
+                # The cancellation_token is now managed by the caller (the worker)
+                for task in tasks:
                     task.cancel()
-
-                try:
-                    chunk = get_item_task.result()
-                except asyncio.CancelledError:
-                    log.info(f"{log_prefix} Get item task was cancelled.")
-                    break
-
-                if chunk is None:
-                    log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
-                    break
-                yield chunk
-                pcm_chunk_queue.task_done()
-
-        # 7. Stream the output
-        try:
-            async for audio_chunk in encoder.encode(pcm_generator()):
-                if not first_chunk_generated:
-                    time_to_first_chunk = time.time() - start_time
-                    log.info(f"[{request_id}] Time to first audio chunk: {time_to_first_chunk:.4f}s")
-                    first_chunk_generated = True
-                yield audio_chunk
-        finally:
-            # Cleanup: Cancel tasks and clear tensors
-            log.info(f"{log_prefix} Cleaning up...")
-            # The cancellation_token is now managed by the caller (the worker)
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            log.info(f"{log_prefix} Cleanup complete.")
+                await asyncio.gather(*tasks, return_exceptions=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                log.info(f"{log_prefix} Cleanup complete.")
 
 
