@@ -536,28 +536,35 @@ sequenceDiagram
     participant ZMQ_Results as Result Queue (ZMQ)
 
     Client->>+Master: POST /tts/generate
-    Master->>+ZMQ_Jobs: Push TTSRequest
-    ZMQ_Jobs->>-Worker: Pull TTSRequest
-    Worker-->>-ZMQ_Jobs:
+    Master->>ZMQ_Jobs: Push TTSRequest
+
+    activate Worker
+    ZMQ_Jobs->>Worker: Pull TTSRequest
 
     par
-        Worker->>+T3_Producer: Run(_t3_producer_task)
+        Worker->>T3_Producer: Run(_t3_producer_task)
+        activate T3_Producer
         T3_Producer-->>T3_Producer: Text -> Speech Tokens
         T3_Producer->>S3Gen_Producer: Enqueue Speech Tokens
+        deactivate T3_Producer
     and
-        Worker->>+S3Gen_Producer: Run(_s3gen_producer_task)
+        Worker->>S3Gen_Producer: Run(_s3gen_producer_task)
+        activate S3Gen_Producer
         S3Gen_Producer-->>S3Gen_Producer: Tokens -> GPU Audio
         S3Gen_Producer->>PCM_Consumer: Enqueue GPU Audio
+        deactivate S3Gen_Producer
     and
-        Worker->>+PCM_Consumer: Run(_pcm_consumer_task)
+        Worker->>PCM_Consumer: Run(_pcm_consumer_task)
+        activate PCM_Consumer
         PCM_Consumer-->>PCM_Consumer: GPU Audio -> PCM Bytes
         PCM_Consumer->>Worker: Enqueue PCM Chunks
+        deactivate PCM_Consumer
     end
 
     loop Audio Streaming
-        Worker->>+ZMQ_Results: Push Audio Chunk
-        ZMQ_Results-->>-Master: Pull Audio Chunk
-        Master-->>-Client: Stream Audio Chunk
+        Worker->>ZMQ_Results: Push Audio Chunk
+        ZMQ_Results-->>Master: Pull Audio Chunk
+        Master-->>Client: Stream Audio Chunk
     end
 
     deactivate Worker
