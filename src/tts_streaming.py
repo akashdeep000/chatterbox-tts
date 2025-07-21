@@ -51,8 +51,6 @@ from src.text_processing import split_text_into_chunks
 from src.logging_config import log
 from .audio_encoding import AudioEncoder
 
-from .process_pool_workers import initialize_tokenizer, tokenize_chunk_worker
-
 async def async_generator_wrapper(sync_generator: Generator, executor: concurrent.futures.Executor, batch_size: int = 32):
     """
     Wraps a synchronous generator to make it asynchronously iterable.
@@ -88,6 +86,24 @@ async def async_generator_wrapper(sync_generator: Generator, executor: concurren
 
 
 @dataclass
+class CancellationToken:
+    """A token to signal cancellation to running tasks, using an asyncio.Event."""
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._event = asyncio.Event()
+
+    def cancel(self):
+        """Signal cancellation."""
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        """Check if cancellation has been signaled."""
+        return self._event.is_set()
+
+    async def wait(self):
+        """Wait for the cancellation signal."""
+        await self._event.wait()
+
+@dataclass
 class Conditionals:
     """Holds conditioning information for TTS models."""
     t3: T3Cond
@@ -118,6 +134,7 @@ class SynthesisParams:
     loop: asyncio.AbstractEventLoop
     text_chunk_count: int
     request_id: str
+    cancellation_token: "CancellationToken"
 
 
 class _AudioProcessor:
@@ -150,13 +167,12 @@ class TextToSpeechEngine:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
-    def __init__(self, gpu_id: int = 0, pcm_conversion_executor=None, text_processing_executor=None, text_tokenization_executor=None, t3_producer_executor=None, s3gen_producer_executor=None, voice_conditioning_executor=None):
+    def __init__(self, device: str):
         """
-        Initializes the TTS engine, setting up basic attributes.
-        Model loading and device setup are handled asynchronously by `ainit`.
+        Initializes the TTS engine for a single worker process.
         """
-        self.gpu_id = gpu_id
-        self.device = None # Will be set during async initialization
+        self.device = device
+        self.gpu_id = int(device.split(":")[-1]) if "cuda" in device else -1 # -1 for CPU
         self.tts = None # Will be loaded during async initialization
         self.voice_manager = VoiceManager()
         self.voice_cache: dict[str, Conditionals] = {}
@@ -168,17 +184,27 @@ class TextToSpeechEngine:
         self._initialization_error: Optional[str] = None
         self.tts_semaphore = asyncio.Semaphore(settings.CONCURRENT_REQUESTS_PER_WORKER)
 
-        # Use shared executors if provided, otherwise create new ones for standalone use.
-        self.pcm_conversion_executor = pcm_conversion_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.text_processing_executor = text_processing_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.text_tokenization_executor = text_tokenization_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.t3_producer_executor = t3_producer_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.s3gen_producer_executor = s3gen_producer_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
-        self.voice_conditioning_executor = voice_conditioning_executor or concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        # Each worker process has its own simple, un-shared executors.
+        self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.text_tokenization_executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.t3_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.s3gen_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
+        self.voice_conditioning_executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.CONCURRENT_REQUESTS_PER_WORKER)
 
         self.fade_in_curve = None
         self.fade_out_curve = None
 
+    def shutdown(self):
+        """Gracefully shuts down the engine's internal thread pools."""
+        log.info("Shutting down internal executors...")
+        self.pcm_conversion_executor.shutdown(wait=True)
+        self.text_processing_executor.shutdown(wait=True)
+        self.text_tokenization_executor.shutdown(wait=True)
+        self.t3_producer_executor.shutdown(wait=True)
+        self.s3gen_producer_executor.shutdown(wait=True)
+        self.voice_conditioning_executor.shutdown(wait=True)
+        log.info("Internal executors shut down.")
 
     async def ainit(self):
         """
@@ -189,20 +215,10 @@ class TextToSpeechEngine:
             self._initialization_state = InitializationState.INITIALIZING
             self._initialization_progress = "Validating configuration..."
 
-            # Auto-detect best available device
-            if torch.cuda.is_available():
-                self.device = f"cuda:{self.gpu_id}"
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-
-
-            log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-            log.info(f"{log_prefix} Initializing Chatterbox TTS model...")
-            log.info(f"{log_prefix} Device: {self.device}, Model path: {settings.MODEL_PATH}")
+            log.info("Initializing Chatterbox TTS model...")
+            log.info(f"Device: {self.device}, Model path: {settings.MODEL_PATH}")
             if self.device == "cpu":
-                log.warning(f"{log_prefix} WARNING: No CUDA or MPS device found. Falling back to CPU. Performance will be significantly degraded.")
+                log.warning("WARNING: No CUDA or MPS device found. Falling back to CPU. Performance will be significantly degraded.")
 
 
             self._initialization_progress = "Configuring device compatibility..."
@@ -234,7 +250,7 @@ class TextToSpeechEngine:
             # Initialize model with run_in_executor for non-blocking
             loop = asyncio.get_event_loop()
             self.tts = await loop.run_in_executor(
-                None,
+                self.text_processing_executor,
                 lambda: OriginalChatterboxTTS.from_local(
                     settings.MODEL_PATH,
                     device=self.device
@@ -243,23 +259,23 @@ class TextToSpeechEngine:
             self.sr = self.tts.sr # Set sample rate from the loaded model
 
             # Compile the T3 model for performance, with a fallback for safety.
-            log.info(f"{log_prefix} Attempting to compile T3 model with torch.compile...")
+            log.info("Attempting to compile T3 model with torch.compile...")
             try:
                 compiled_t3 = torch.compile(self.tts.t3, mode="reduce-overhead", fullgraph=True)
                 self.tts.t3 = compiled_t3
                 # Verify that the model is now a compiled module
                 if "OptimizedModule" in str(type(self.tts.t3)):
-                    log.info(f"{log_prefix} T3 model successfully compiled.")
+                    log.info("T3 model successfully compiled.")
                 else:
-                    log.warning(f"{log_prefix} T3 model compilation did not return an OptimizedModule. Type is {type(self.tts.t3)}")
+                    log.warning(f"T3 model compilation did not return an OptimizedModule. Type is {type(self.tts.t3)}")
             except Exception as e:
-                log.warning(f"{log_prefix} T3 model compilation failed: {e}. Falling back to the original model.")
+                log.warning(f"T3 model compilation failed: {e}. Falling back to the original model.")
 
             # Warm-up run to pay the compilation cost upfront
-            log.info(f"{log_prefix} Performing warm-up run for compiled T3 model...")
+            log.info("Performing warm-up run for compiled T3 model...")
             try:
                 # Use default conditionals if available, otherwise this will raise an error
-                conds = await self._prepare_and_get_conds(None, 0.5, loop, "warmup")
+                conds = await self._prepare_and_get_conds(None, loop, "warmup")
 
                 # Create dummy text input
                 warmup_text = "compiling"
@@ -280,21 +296,21 @@ class TextToSpeechEngine:
                     warmup_speech_tokens = token
                     break # We only need one token
 
-                log.info(f"{log_prefix} T3 model warm-up complete.")
+                log.info("T3 model warm-up complete.")
 
                 # Compile and warm-up the S3Gen model, with a fallback for safety.
-                log.info(f"{log_prefix} Attempting to compile S3Gen model with torch.compile...")
+                log.info("Attempting to compile S3Gen model with torch.compile...")
                 try:
                     compiled_s3gen = torch.compile(self.tts.s3gen, mode="reduce-overhead", fullgraph=True)
                     self.tts.s3gen = compiled_s3gen
                     if "OptimizedModule" in str(type(self.tts.s3gen)):
-                        log.info(f"{log_prefix} S3Gen model successfully compiled.")
+                        log.info("S3Gen model successfully compiled.")
                     else:
-                        log.warning(f"{log_prefix} S3Gen model compilation did not return an OptimizedModule. Type is {type(self.tts.s3gen)}")
+                        log.warning(f"S3Gen model compilation did not return an OptimizedModule. Type is {type(self.tts.s3gen)}")
                 except Exception as e:
-                    log.warning(f"{log_prefix} S3Gen model compilation failed: {e}. Falling back to the original model.")
+                    log.warning(f"S3Gen model compilation failed: {e}. Falling back to the original model.")
 
-                log.info(f"{log_prefix} Performing warm-up run for compiled S3Gen model...")
+                log.info("Performing warm-up run for compiled S3Gen model...")
                 if warmup_speech_tokens is not None:
                     # Use the token from the T3 warm-up to warm up S3Gen
                     self.tts.s3gen.inference(
@@ -302,26 +318,24 @@ class TextToSpeechEngine:
                         ref_dict=conds.gen,
                         cache_source=torch.zeros(1, 1, 0).to(self.device)
                     )
-                    log.info(f"{log_prefix} S3Gen model warm-up complete.")
+                    log.info("S3Gen model warm-up complete.")
                 else:
-                    log.warning(f"{log_prefix} S3Gen model warm-up skipped: no tokens from T3 warm-up.")
+                    log.warning("S3Gen model warm-up skipped: no tokens from T3 warm-up.")
 
             except Exception as e:
-                log.warning(f"{log_prefix} Model warm-up failed: {e}. The first request may be slow.")
+                log.warning(f"Model warm-up failed: {e}. The first request may be slow.")
 
             self._initialization_state = InitializationState.READY
             self._initialization_progress = "Model ready"
             self._initialization_error = None
-            log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-            log.info(f"✓ {log_prefix} Model initialized successfully on {self.device}")
+            log.info(f"✓ Model initialized successfully on {self.device}")
             return self.tts
 
         except Exception as e:
             self._initialization_state = InitializationState.ERROR
             self._initialization_error = str(e)
             self._initialization_progress = f"Failed: {str(e)}"
-            log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
-            log.error(f"✗ {log_prefix} Failed to initialize model: {e}")
+            log.error(f"✗ Failed to initialize model: {e}", exc_info=True)
             raise e
 
     def get_initialization_status(self) -> dict:
@@ -332,15 +346,19 @@ class TextToSpeechEngine:
             "error": self._initialization_error
         }
 
-    def clear_voice_cache(self, voice_id: Optional[str] = None):
-        """Clears the voice cache."""
-        if voice_id and voice_id in self.voice_cache:
+    def clear_voice_cache(self, voice_id: str):
+        """Clears a specific voice from the cache."""
+        if voice_id in self.voice_cache:
             del self.voice_cache[voice_id]
-        elif not voice_id:
-            self.voice_cache.clear()
+            log.info(f"Removed voice '{voice_id}' from cache.")
+        else:
+            log.warning(f"Attempted to clear non-existent voice '{voice_id}' from cache.")
 
-    def prepare_conditionals(self, wav_fpath: str, voice_exaggeration_factor: float = 0.5):
-        """Prepares conditioning information from a reference audio file."""
+    def prepare_conditionals(self, wav_fpath: str):
+        """
+        Prepares conditioning information from a reference audio file using the
+        global voice_exaggeration_factor from the configuration.
+        """
         s3gen_ref_wav, _ = librosa.load(wav_fpath, sr=S3GEN_SR)
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
@@ -356,26 +374,27 @@ class TextToSpeechEngine:
         ve_embed = torch.from_numpy(self.tts.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
-
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=voice_exaggeration_factor * torch.ones(1, 1, 1),
+            emotion_adv=tts_config.VOICE_EXAGGERATION_FACTOR * torch.ones(1, 1, 1),
         ).to(device=torch.device(self.device))
 
         voice_id = Path(wav_fpath).name
         self.voice_cache[voice_id] = Conditionals(t3_cond, s3gen_ref_dict)
 
-    async def _prepare_and_get_conds(self, audio_prompt_path: Optional[str], voice_exaggeration_factor: float, loop: asyncio.AbstractEventLoop, request_id: str) -> Conditionals:
-        """Prepares and retrieves the appropriate conditionals."""
-        log_prefix = f"[GPU {self.gpu_id}]" if self.device != "cpu" else "[CPU]"
+    async def _prepare_and_get_conds(self, audio_prompt_path: Optional[str], loop: asyncio.AbstractEventLoop, request_id: str) -> Conditionals:
+        """
+        Prepares and retrieves the appropriate conditionals. Since voice_exaggeration_factor
+        is now a global setting, we no longer need to check for per-request changes.
+        """
         voice_id = Path(audio_prompt_path).name if audio_prompt_path else "default"
         if audio_prompt_path and voice_id not in self.voice_cache:
-            log.info(f"{log_prefix}[{request_id}] Voice '{voice_id}' not in cache. Preparing new conditionals...")
-            await loop.run_in_executor(self.voice_conditioning_executor, self.prepare_conditionals, audio_prompt_path, voice_exaggeration_factor)
-            log.info(f"{log_prefix}[{request_id}] Finished preparing conditionals for '{voice_id}'.")
+            log.info(f"[{request_id}] Voice '{voice_id}' not in cache. Preparing new conditionals...")
+            await loop.run_in_executor(self.voice_conditioning_executor, self.prepare_conditionals, audio_prompt_path)
+            log.info(f"[{request_id}] Finished preparing conditionals for '{voice_id}'.")
         elif audio_prompt_path:
-            log.info(f"{log_prefix}[{request_id}] Using cached conditionals for voice '{voice_id}'.")
+            log.info(f"[{request_id}] Using cached conditionals for voice '{voice_id}'.")
 
         conds = self.voice_cache.get(voice_id)
         if conds is None:
@@ -384,14 +403,6 @@ class TextToSpeechEngine:
             else:
                 raise ValueError("No audio prompt provided, and no default conditionals are loaded.")
 
-        current_exaggeration_tensor = voice_exaggeration_factor * torch.ones(1, 1, 1, device=self.device)
-        if not torch.equal(conds.t3.emotion_adv, current_exaggeration_tensor):
-            _cond: T3Cond = conds.t3
-            conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=current_exaggeration_tensor,
-            ).to(device=self.device)
         return conds
 
     def _blocking_t3_inference(
@@ -436,21 +447,22 @@ class TextToSpeechEngine:
         """Producer task for T3 model. Generates speech tokens and puts them into a queue."""
         num_chunks = len(text_chunks)
         loop = params.loop
-        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
-        log_prefix = f"[{device_str}][{params.request_id}][T3_PRODUCER]"
+        log_prefix = f"[{params.request_id}][T3_PRODUCER]"
 
         try:
             for i, chunk in enumerate(text_chunks):
+                if params.cancellation_token.is_cancelled():
+                    log.info(f"{log_prefix} Cancellation detected. Stopping T3 producer.")
+                    break
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
 
                 log.info(f"{log_prefix} Processing text chunk {i+1}/{num_chunks}. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
                 # 1. Text to Tokens (using ProcessPoolExecutor for true parallelism)
                 tokenizer_start_time = time.time()
-                token_list = await loop.run_in_executor(
-                    self.text_tokenization_executor, tokenize_chunk_worker, chunk
+                text_tokens = await loop.run_in_executor(
+                    self.text_tokenization_executor, self.tts.tokenizer.text_to_tokens, chunk
                 )
-                text_tokens = torch.tensor(token_list, dtype=torch.long)
                 log.info(f"{log_prefix} Tokenizer took {time.time() - tokenizer_start_time:.4f}s")
                 is_first_text_chunk = (i == 0)
                 is_last_text_chunk = (i == num_chunks - 1)
@@ -490,12 +502,33 @@ class TextToSpeechEngine:
                 generator_exhausted = False # Initialize the flag
 
                 while True:
+                    if params.cancellation_token.is_cancelled():
+                        log.info(f"{log_prefix} Cancellation detected during token iteration.")
+                        break
+
+                    get_item_task = asyncio.create_task(token_iterator.__anext__())
+                    cancel_task = asyncio.create_task(params.cancellation_token.wait())
+                    done, pending = await asyncio.wait(
+                        [get_item_task, cancel_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    if cancel_task in done:
+                        get_item_task.cancel()
+                        log.info(f"{log_prefix} Cancellation detected while waiting for token. Stopping T3 producer.")
+                        break
+
+                    for task in pending:
+                        task.cancel()
+
                     try:
-                        # Fill up current_slice as tokens come
-                        current_slice.append(await token_iterator.__anext__())
+                        token = get_item_task.result()
+                        current_slice.append(token)
                     except StopAsyncIteration:
-                        # Generator is exhausted. Process remaining tokens.
                         generator_exhausted = True
+                    except asyncio.CancelledError:
+                        log.info(f"{log_prefix} Get token task was cancelled.")
+                        break
 
                     # If current_slice length is larger than (look_ahead_buffer_size + audio_tokens_per_slice)
                     # send first audio_tokens_per_slice tokens to s3gen queue.
@@ -566,8 +599,7 @@ class TextToSpeechEngine:
     ):
         """Producer task for S3Gen model. Converts speech tokens to audio chunks, handling all GPU-side processing."""
         loop = params.loop
-        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
-        log_prefix = f"[{device_str}][{params.request_id}][S3GEN_PRODUCER]"
+        log_prefix = f"[{params.request_id}][S3GEN_PRODUCER]"
         current_text_chunk_accumulated_tokens = None
         cache_source = torch.zeros(1, 1, 0).to(self.device)
         last_text_chunk_num = -1
@@ -577,11 +609,32 @@ class TextToSpeechEngine:
 
         try:
             while True:
-                start_time = time.time()
-                log.debug(f"{log_prefix} Waiting for speech tokens. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                queue_item = await speech_token_queue.get()
-                wait_time = time.time() - start_time
-                log.debug(f"{log_prefix} Waited for speech tokens for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+                if params.cancellation_token.is_cancelled():
+                    log.info(f"{log_prefix} Cancellation detected. Stopping S3Gen producer.")
+                    break
+
+                get_item_task = asyncio.create_task(speech_token_queue.get())
+                cancel_task = asyncio.create_task(params.cancellation_token.wait())
+                done, pending = await asyncio.wait(
+                    [get_item_task, cancel_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if cancel_task in done:
+                    get_item_task.cancel() # Cancel the pending queue.get()
+                    log.info(f"{log_prefix} Cancellation detected while waiting for speech token. Stopping S3Gen producer.")
+                    break
+
+                # If we are here, get_item_task is done.
+                for task in pending:
+                    task.cancel()
+
+                try:
+                    queue_item = get_item_task.result()
+                except asyncio.CancelledError:
+                    log.info(f"{log_prefix} Get item task was cancelled.")
+                    break
+
                 if queue_item is None:
                     break
 
@@ -715,15 +768,34 @@ class TextToSpeechEngine:
     ):
         """Consumes audio tensors from the GPU queue and converts them to PCM data."""
         loop = params.loop
-        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
-        log_prefix = f"[{device_str}][{params.request_id}][PCM_CONSUMER]"
+        log_prefix = f"[{params.request_id}][PCM_CONSUMER]"
         try:
             while True:
-                start_time = time.time()
-                log.debug(f"{log_prefix} Waiting for audio tensor. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                queue_item = await gpu_audio_queue.get()
-                wait_time = time.time() - start_time
-                log.debug(f"{log_prefix} Waited for audio tensor for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
+                if params.cancellation_token.is_cancelled():
+                    log.info(f"{log_prefix} Cancellation detected. Stopping PCM consumer.")
+                    break
+
+                get_item_task = asyncio.create_task(gpu_audio_queue.get())
+                cancel_task = asyncio.create_task(params.cancellation_token.wait())
+                done, pending = await asyncio.wait(
+                    [get_item_task, cancel_task],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if cancel_task in done:
+                    get_item_task.cancel()
+                    log.info(f"{log_prefix} Cancellation detected while waiting for audio tensor. Stopping PCM consumer.")
+                    break
+
+                for task in pending:
+                    task.cancel()
+
+                try:
+                    queue_item = get_item_task.result()
+                except asyncio.CancelledError:
+                    log.info(f"{log_prefix} Get item task was cancelled.")
+                    break
+
                 if queue_item is None:
                     break
                 audio_tensor, text_chunk_num, slice_num, is_first_slice, is_last_slice, is_first_text_chunk, is_last_text_chunk = queue_item
@@ -744,218 +816,155 @@ class TextToSpeechEngine:
         self,
         text: str,
         output_format: str,
-        voice_id: Optional[str] = None,
-        voice_exaggeration_factor: float = 0.5,
-        cfg_guidance_weight: float = 2.0,
-        synthesis_temperature: float = 0.9,
-        text_processing_chunk_size: int = 120,
-        audio_tokens_per_slice: int = 100,
-        remove_trailing_milliseconds: int = 0,
-        remove_leading_milliseconds: int = 0,
-        chunk_overlap_strategy: Literal["zero", "full"] = "zero",
-        crossfade_duration_milliseconds: int = 20,
-        start_time: float = 0.0,
-        request_id: str = "N/A"
+        voice_id: Optional[str],
+        cfg_guidance_weight: float,
+        synthesis_temperature: float,
+        text_processing_chunk_size: int,
+        audio_tokens_per_slice: int,
+        remove_trailing_milliseconds: int,
+        remove_leading_milliseconds: int,
+        chunk_overlap_strategy: Literal["zero", "full"],
+        crossfade_duration_milliseconds: int,
+        request_id: str,
+        cancellation_token: CancellationToken
     ) -> AsyncGenerator[bytes, None]:
         """Streams synthesized audio in the specified format."""
-        if self._initialization_state != InitializationState.READY:
-            raise RuntimeError(f"TTS Engine on GPU {self.gpu_id} is not ready. Status: {self._initialization_state.value}")
+        log.info(f"[{request_id}] New stream request. Waiting for semaphore.")
+        async with self.tts_semaphore:
+            log.info(f"[{request_id}] Semaphore acquired. Starting stream processing.")
+            if self._initialization_state != InitializationState.READY:
+                raise RuntimeError(f"TTS Engine on GPU {self.gpu_id} is not ready. Status: {self._initialization_state.value}")
 
-        loop = asyncio.get_running_loop()
-        first_chunk_generated = False
-        time_to_first_chunk = 0.0
+            loop = asyncio.get_running_loop()
+            first_chunk_generated = False
+            time_to_first_chunk = 0.0
+            start_time = time.time()
 
-        # 1. Get Voice Conditionals
-        audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
-        conds = await self._prepare_and_get_conds(audio_prompt_path, voice_exaggeration_factor, loop, request_id)
+            # 1. Get Voice Conditionals
+            audio_prompt_path = self.voice_manager.get_voice_path(voice_id) if voice_id else None
+            conds = await self._prepare_and_get_conds(audio_prompt_path, loop, request_id)
 
-        # 2. Text Processing
-        text_chunks = await loop.run_in_executor(
-            self.text_processing_executor,
-            split_text_into_chunks,
-            text,
-            text_processing_chunk_size
-        )
-        if not text_chunks:
-            yield b''
-            return
+            # 2. Text Processing
+            text_chunks = await loop.run_in_executor(
+                self.text_processing_executor,
+                split_text_into_chunks,
+                text,
+                text_processing_chunk_size
+            )
+            if not text_chunks:
+                yield b''
+                return
 
-        # 3. Setup Queues and CUDA Streams
-        speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
-        gpu_audio_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
-        pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
-        is_cuda = self.device.startswith('cuda')
-        t3_stream = torch.cuda.Stream() if is_cuda else None
-        s3gen_stream = torch.cuda.Stream() if is_cuda else None
+            # 3. Setup Queues and CUDA Streams
+            speech_token_queue = asyncio.Queue(maxsize=tts_config.SPEECH_TOKEN_QUEUE_MAX_SIZE)
+            gpu_audio_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
+            pcm_chunk_queue = asyncio.Queue(maxsize=tts_config.PCM_CHUNK_QUEUE_MAX_SIZE)
+            is_cuda = self.device.startswith('cuda')
+            t3_stream = torch.cuda.Stream() if is_cuda else None
+            s3gen_stream = torch.cuda.Stream() if is_cuda else None
 
-        # Pre-calculate fade curves to avoid repeated computation in the hot loop
-        fade_len = int(self.sr * (crossfade_duration_milliseconds / 1000.0))
-        if fade_len > 0:
-            t = torch.linspace(0, 1, fade_len, device=self.device)
-            self.fade_out_curve = torch.cos(t * 0.5 * torch.pi)
-            self.fade_in_curve = torch.sin(t * 0.5 * torch.pi)
-        else:
-            self.fade_in_curve = None
-            self.fade_out_curve = None
+            # Pre-calculate fade curves to avoid repeated computation in the hot loop
+            fade_len = int(self.sr * (crossfade_duration_milliseconds / 1000.0))
+            if fade_len > 0:
+                t = torch.linspace(0, 1, fade_len, device=self.device)
+                self.fade_out_curve = torch.cos(t * 0.5 * torch.pi)
+                self.fade_in_curve = torch.sin(t * 0.5 * torch.pi)
+            else:
+                self.fade_in_curve = None
+                self.fade_out_curve = None
 
-        # 4. Create Synthesis Parameters
-        synthesis_params = SynthesisParams(
-            text_tokens=None,
-            conds=conds,
-            cfg_guidance_weight=cfg_guidance_weight,
-            synthesis_temperature=synthesis_temperature,
-            text_processing_chunk_size=text_processing_chunk_size,
-            audio_tokens_per_slice=audio_tokens_per_slice,
-            remove_trailing_milliseconds=remove_trailing_milliseconds,
-            remove_leading_milliseconds=remove_leading_milliseconds,
-            chunk_overlap_strategy=chunk_overlap_strategy,
-            crossfade_duration_milliseconds=crossfade_duration_milliseconds,
-            loop=loop,
-            text_chunk_count=len(text_chunks),
-            request_id=request_id
-        )
+            # 4. Create Synthesis Parameters
+            synthesis_params = SynthesisParams(
+                text_tokens=None,
+                conds=conds,
+                cfg_guidance_weight=cfg_guidance_weight,
+                synthesis_temperature=synthesis_temperature,
+                text_processing_chunk_size=text_processing_chunk_size,
+                audio_tokens_per_slice=audio_tokens_per_slice,
+                remove_trailing_milliseconds=remove_trailing_milliseconds,
+                remove_leading_milliseconds=remove_leading_milliseconds,
+                chunk_overlap_strategy=chunk_overlap_strategy,
+                crossfade_duration_milliseconds=crossfade_duration_milliseconds,
+                loop=loop,
+                text_chunk_count=len(text_chunks),
+                request_id=request_id,
+                cancellation_token=cancellation_token # This is now passed in
+            )
 
-        # 5. Start Producer and Consumer Tasks
-        t3_producer = asyncio.create_task(
-            self._t3_producer_task(text_chunks, speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, t3_stream, s3gen_stream)
-        )
-        s3gen_producer = asyncio.create_task(
-            self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
-        )
-        pcm_consumer = asyncio.create_task(
-            self._pcm_consumer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params)
-        )
-
-        # 6. Setup Audio Encoder
-        device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
-        log_prefix = f"[{device_str}][{request_id}]"
-
-        encoder = AudioEncoder(
-            output_format,
-            self.sr,
-            log_prefix=log_prefix
-        )
-
-        async def pcm_generator():
-            """Generator that yields PCM chunks from the queue."""
-            while True:
-                log.debug(f"{log_prefix} Waiting for PCM chunk. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                start_time = time.time()
-                chunk = await pcm_chunk_queue.get()
-                wait_time = time.time() - start_time
-                log.debug(f"{log_prefix} Waited for PCM chunk for {wait_time:.4f}s. Queues: speech_token_q:{speech_token_queue.qsize()}, gpu_audio_q:{gpu_audio_queue.qsize()}, pcm_chunk_q:{pcm_chunk_queue.qsize()}")
-                if chunk is None:
-                    log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
-                    break
-                yield chunk
-                pcm_chunk_queue.task_done()
-
-        # 7. Stream the output
-        try:
-            async for audio_chunk in encoder.encode(pcm_generator()):
-                if not first_chunk_generated:
-                    time_to_first_chunk = time.time() - start_time
-                    device_str = f"GPU {self.gpu_id}" if self.device != "cpu" else "CPU"
-                    log.info(f"[{device_str}][{request_id}] Time to first audio chunk: {time_to_first_chunk:.4f}s")
-                    first_chunk_generated = True
-                yield audio_chunk
-        finally:
-            # Cleanup: Cancel tasks and clear tensors
-            log.info(f"{log_prefix} Cleaning up...")
+            # 5. Start Producer and Consumer Tasks
+            t3_producer = asyncio.create_task(
+                self._t3_producer_task(text_chunks, speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, t3_stream, s3gen_stream)
+            )
+            s3gen_producer = asyncio.create_task(
+                self._s3gen_producer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params, s3gen_stream)
+            )
+            pcm_consumer = asyncio.create_task(
+                self._pcm_consumer_task(speech_token_queue, gpu_audio_queue, pcm_chunk_queue, synthesis_params)
+            )
             tasks = [t3_producer, s3gen_producer, pcm_consumer]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
 
-class TTSEngineManager:
-    """Manages multiple TTS engine instances, distributing load across available GPUs."""
+            # 6. Setup Audio Encoder
+            log_prefix = f"[{request_id}]"
 
-    def __init__(self, num_gpus: int):
-        """
-        Initializes the manager, creates shared executors, and creates a TTS engine for each GPU.
-        """
-        self.num_gpus = num_gpus
+            encoder = AudioEncoder(
+                output_format,
+                self.sr,
+                log_prefix=log_prefix
+            )
 
-        # Create a single, shared set of executors for all engines to use.
-        # This prevents thread over-allocation when using multiple GPUs.
-        total_workers = settings.CONCURRENT_REQUESTS_PER_WORKER * (num_gpus if num_gpus > 0 else 1)
+            async def pcm_generator():
+                """Generator that yields PCM chunks from the queue."""
+                while True:
+                    if cancellation_token.is_cancelled():
+                        log.debug(f"{log_prefix} Cancellation detected in PCM generator.")
+                        break
 
-        self.pcm_conversion_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
-        self.text_processing_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
-        # Use a ProcessPoolExecutor for the CPU-bound tokenization to bypass the GIL.
-        # The initializer ensures each worker process has its own tokenizer instance, avoiding pickling errors.
-        tokenizer_path = os.path.join(settings.MODEL_PATH, "tokenizer.json")
-        self.text_tokenization_executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=total_workers,
-            initializer=initialize_tokenizer,
-            initargs=(tokenizer_path,)
-        )
-        self.t3_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
-        self.s3gen_producer_executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
-        self.voice_conditioning_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    get_item_task = asyncio.create_task(pcm_chunk_queue.get())
+                    cancel_task = asyncio.create_task(cancellation_token.wait())
+                    done, pending = await asyncio.wait(
+                        [get_item_task, cancel_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
 
-        engine_args = {
-            "pcm_conversion_executor": self.pcm_conversion_executor,
-            "text_processing_executor": self.text_processing_executor,
-            "text_tokenization_executor": self.text_tokenization_executor,
-            "t3_producer_executor": self.t3_producer_executor,
-            "s3gen_producer_executor": self.s3gen_producer_executor,
-            "voice_conditioning_executor": self.voice_conditioning_executor,
-        }
+                    if cancel_task in done:
+                        get_item_task.cancel()
+                        log.info(f"{log_prefix} Cancellation detected while waiting for PCM chunk. Stopping PCM generator.")
+                        break
 
-        if self.num_gpus > 0:
-            self.engines: List[TextToSpeechEngine] = [TextToSpeechEngine(gpu_id=i, **engine_args) for i in range(num_gpus)]
-        else:
-            # Fallback to a single CPU engine if no GPUs are detected
-            self.engines: List[TextToSpeechEngine] = [TextToSpeechEngine(gpu_id=0, **engine_args)]
-        self._lock = asyncio.Lock()
-        self._next_engine_index = 0
+                    for task in pending:
+                        task.cancel()
 
-    async def ainit(self):
-        """
-        Asynchronously initializes all managed TTS engines.
-        """
-        log.info(f"Initializing {len(self.engines)} TTS engine(s)...")
-        init_tasks = [engine.ainit() for engine in self.engines]
-        await asyncio.gather(*init_tasks)
-        log.info("All TTS engines initialized.")
+                    try:
+                        chunk = get_item_task.result()
+                    except asyncio.CancelledError:
+                        log.info(f"{log_prefix} Get item task was cancelled.")
+                        break
 
-    async def get_engine(self) -> TextToSpeechEngine:
-        """
-        Selects the TTS engine with the fewest active requests.
-        This ensures that load is distributed to the least busy engine.
-        """
-        if not self.engines:
-            raise RuntimeError("No TTS engines available.")
+                    if chunk is None:
+                        log.debug(f"{log_prefix} PCM chunk queue is empty. Breaking.")
+                        break
+                    yield chunk
+                    pcm_chunk_queue.task_done()
 
-        # Find the engine with the most available semaphore slots (least busy)
-        # The semaphore's internal value is the number of free slots.
-        best_engine = max(self.engines, key=lambda e: e.tts_semaphore._value)
+            # 7. Stream the output
+            try:
+                async for audio_chunk in encoder.encode(pcm_generator()):
+                    if not first_chunk_generated:
+                        time_to_first_chunk = time.time() - start_time
+                        log.info(f"[{request_id}] Time to first audio chunk: {time_to_first_chunk:.4f}s")
+                        first_chunk_generated = True
+                    yield audio_chunk
+            finally:
+                # Cleanup: Cancel tasks and clear tensors
+                log.info(f"{log_prefix} Cleaning up...")
+                # The cancellation_token is now managed by the caller (the worker)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                log.info(f"{log_prefix} Cleanup complete.")
 
-        log.info(f"Selected least busy TTS engine on GPU {best_engine.gpu_id} with {best_engine.tts_semaphore._value} free slots.")
-        return best_engine
 
-    def get_all_engines(self) -> List[TextToSpeechEngine]:
-        """Returns all engine instances."""
-        return self.engines
-
-    def get_status(self) -> dict:
-        """
-        Returns the initialization status of all managed engines.
-        """
-        return {f"gpu_{engine.gpu_id}": engine.get_initialization_status() for engine in self.engines}
-
-    def shutdown(self):
-        """Shuts down all shared executors."""
-        log.info("Shutting down all shared executors...")
-        self.pcm_conversion_executor.shutdown(wait=True)
-        self.text_processing_executor.shutdown(wait=True)
-        self.text_tokenization_executor.shutdown(wait=True)
-        self.t3_producer_executor.shutdown(wait=True)
-        self.s3gen_producer_executor.shutdown(wait=True)
-        self.voice_conditioning_executor.shutdown(wait=True)
-        log.info("All shared executors shut down.")

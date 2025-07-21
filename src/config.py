@@ -50,9 +50,14 @@ class AppConfig(BaseSettings):
         description="List of allowed origins for CORS. Use '*' to allow all origins."
     )
 
+    # Concurrency settings
     CONCURRENT_REQUESTS_PER_WORKER: int = Field(
         default=1,
         description="Maximum number of concurrent TTS requests to process per GPU or CPU."
+    )
+    WORKERS_PER_DEVICE: int = Field(
+        default=1,
+        description="Number of worker processes to spawn per detected GPU or CPU device."
     )
 
     class Config:
