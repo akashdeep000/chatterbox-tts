@@ -829,7 +829,7 @@ class TextToSpeechEngine:
         cancellation_token: CancellationToken
     ) -> AsyncGenerator[bytes, None]:
         """Streams synthesized audio in the specified format."""
-        log.info(f"[{request_id}] New stream request. Waiting for semaphore. Current queue: {len(self.tts_semaphore._waiters) if hasattr(self.tts_semaphore, '_waiters') else 'N/A'}")
+        log.info(f"[{request_id}] New stream request. Waiting for semaphore.")
         async with self.tts_semaphore:
             log.info(f"[{request_id}] Semaphore acquired. Starting stream processing.")
             if self._initialization_state != InitializationState.READY:
